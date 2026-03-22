@@ -17,3 +17,6 @@ src/latex-to-word/examples/
 
 # 忽略所有doc文件夹
 doc/
+
+# 忽略python中间文件
+__pycache__/
