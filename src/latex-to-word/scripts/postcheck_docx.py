@@ -572,6 +572,74 @@ def is_caption_paragraph(
     return False, "none"
 
 
+def paragraph_contains_image(paragraph: ET.Element) -> bool:
+    """
+    判断段落中是否包含图片对象。
+
+    这里只做结构级判定：
+    - DrawingML: a:blip[@r:embed]
+    - VML: v:imagedata[@r:id]
+    """
+    return bool(paragraph.findall(".//a:blip[@r:embed]", NS) or paragraph.findall(".//v:imagedata[@r:id]", NS))
+
+
+def is_likely_proximity_caption_text(text: str) -> bool:
+    """
+    判断“图/表后紧邻段落文本”是否像题注。
+
+    该判定用于补强 caption 检测，减少仅靠样式/前缀匹配带来的漏检。
+    """
+    candidate = text.strip()
+    if not candidate:
+        return False
+
+    # 太长的段落通常不是题注。
+    if len(candidate) > 120:
+        return False
+
+    # 标题样式文本、编号章节标题不应被视为题注。
+    if re.match(r"^\s*(\d+(\.\d+)*)\s+", candidate):
+        return False
+
+    # 带明显句末标点的完整句子更可能是正文。
+    if candidate.endswith(("。", "；", ";", "？", "?", "！", "!")):
+        return False
+
+    # 避免将明显参考文献条目误判为题注。
+    if is_likely_bibliography_entry(candidate):
+        return False
+
+    return True
+
+
+def is_likely_bibliography_entry(text: str) -> bool:
+    """
+    判断段落是否像“参考文献条目”。
+
+    该判定用于“无明确标题但有条目”的推断，不追求严格格式学判断，
+    目标是降低后检查阶段的误报。
+    """
+    candidate = text.strip()
+    if not candidate:
+        return False
+
+    if re.match(r"^\s*\[\d+\]", candidate):
+        return True
+
+    if re.match(r"^\s*\d+\.\s+", candidate):
+        return True
+
+    if re.search(r"\b(19|20)\d{2}\b", candidate):
+        # 年份 + 常见文献分隔符，是较强信号。
+        if "," in candidate or "." in candidate or "“" in candidate or "\"" in candidate:
+            return True
+
+    if re.search(r"\bdoi\b", candidate, re.IGNORECASE):
+        return True
+
+    return False
+
+
 def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
     """
     检查 docx 文件结构并输出 inventory。
@@ -609,6 +677,10 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
         "figure_caption_count": 0,
         "table_caption_count": 0,
         "unknown_caption_count": 0,
+        "proximity_caption_count_total": 0,
+        "proximity_figure_caption_count": 0,
+        "proximity_table_caption_count": 0,
+        "effective_caption_count_total": 0,
         "math_object_count": 0,
         "bookmark_count": 0,
         "internal_hyperlink_count": 0,
@@ -619,6 +691,9 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
         "bibliography_section_found": False,
         "bibliography_heading_text": None,
         "bibliography_following_paragraph_count": 0,
+        "bibliography_entry_like_count": 0,
+        "bibliography_inferred_by_entries": False,
+        "bibliography_detection_mode": "none",
         "external_hyperlink_relation_count": 0,
         "styles_xml_found": False,
     }
@@ -714,18 +789,44 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
                     inventory["field_toc_count"] += 1
 
             # 段落级统计。
-            paragraphs = document_root.findall(".//w:body/w:p", NS)
+            body = document_root.find(".//w:body", NS)
+            if body is None:
+                findings.append(
+                    Finding(
+                        severity=SEVERITY_ERROR,
+                        code="DOCX_MISSING_BODY_XML",
+                        message="word/document.xml 中未找到 w:body。",
+                        location="word/document.xml",
+                    )
+                )
+                return inventory, findings
+
+            body_children = list(body)
+            paragraphs = [child for child in body_children if child.tag == f"{{{NS['w']}}}p"]
             inventory["paragraph_count"] = len(paragraphs)
 
             paragraph_texts: list[str] = []
             heading_flags: list[bool] = []
+            child_idx_to_para_idx: dict[int, int] = {}
+            para_idx_to_child_idx: dict[int, int] = {}
+            para_idx_to_heading: dict[int, bool] = {}
+            para_idx_to_explicit_caption: dict[int, tuple[bool, str]] = {}
 
-            for paragraph in paragraphs:
+            for child_idx, child in enumerate(body_children):
+                if child.tag != f"{{{NS['w']}}}p":
+                    continue
+
+                paragraph = child
+                para_idx = len(paragraph_texts)
+                child_idx_to_para_idx[child_idx] = para_idx
+                para_idx_to_child_idx[para_idx] = child_idx
+
                 text = get_paragraph_text(paragraph)
                 paragraph_texts.append(text)
 
                 is_heading = is_heading_paragraph(paragraph, heading_style_ids, style_id_to_name)
                 heading_flags.append(is_heading)
+                para_idx_to_heading[para_idx] = is_heading
                 if is_heading:
                     inventory["heading_count"] += 1
 
@@ -737,6 +838,7 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
                         inventory["title_like_count"] += 1
 
                 is_caption, caption_kind = is_caption_paragraph(paragraph, caption_style_ids, style_id_to_name)
+                para_idx_to_explicit_caption[para_idx] = (is_caption, caption_kind)
                 if is_caption:
                     inventory["caption_count_total"] += 1
                     if caption_kind == "figure":
@@ -745,6 +847,61 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
                         inventory["table_caption_count"] += 1
                     else:
                         inventory["unknown_caption_count"] += 1
+
+            # 结构邻近检测（图/表后紧邻段落）：
+            # 当段落样式和前缀都没命中 caption 时，邻近结构可以补充识别。
+            proximity_para_indices: set[int] = set()
+            for child_idx, child in enumerate(body_children):
+                object_kind: Optional[str] = None
+                if child.tag == f"{{{NS['w']}}}tbl":
+                    object_kind = "table"
+                elif child.tag == f"{{{NS['w']}}}p" and paragraph_contains_image(child):
+                    object_kind = "figure"
+
+                if object_kind is None:
+                    continue
+
+                candidate_para_idx: Optional[int] = None
+                for next_idx in range(child_idx + 1, len(body_children)):
+                    next_child = body_children[next_idx]
+                    if next_child.tag != f"{{{NS['w']}}}p":
+                        continue
+                    next_para_idx = child_idx_to_para_idx.get(next_idx)
+                    if next_para_idx is None:
+                        continue
+                    next_text = paragraph_texts[next_para_idx].strip()
+                    if not next_text:
+                        continue
+                    candidate_para_idx = next_para_idx
+                    break
+
+                if candidate_para_idx is None:
+                    continue
+
+                if para_idx_to_heading.get(candidate_para_idx, False):
+                    continue
+
+                explicit_caption, _ = para_idx_to_explicit_caption.get(candidate_para_idx, (False, "none"))
+                if explicit_caption:
+                    continue
+
+                candidate_text = paragraph_texts[candidate_para_idx]
+                if not is_likely_proximity_caption_text(candidate_text):
+                    continue
+
+                if candidate_para_idx in proximity_para_indices:
+                    continue
+
+                proximity_para_indices.add(candidate_para_idx)
+                inventory["proximity_caption_count_total"] += 1
+                if object_kind == "figure":
+                    inventory["proximity_figure_caption_count"] += 1
+                elif object_kind == "table":
+                    inventory["proximity_table_caption_count"] += 1
+
+            inventory["effective_caption_count_total"] = (
+                inventory["caption_count_total"] + inventory["proximity_caption_count_total"]
+            )
 
             # 参考文献章节启发式检查。
             bibliography_heading_patterns = [
@@ -766,16 +923,46 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
 
             if bibliography_heading_index is not None:
                 inventory["bibliography_section_found"] = True
+                inventory["bibliography_detection_mode"] = "heading"
                 inventory["bibliography_heading_text"] = bibliography_heading_text
 
                 count = 0
+                entry_like_count = 0
                 for idx in range(bibliography_heading_index + 1, len(paragraph_texts)):
                     # 遇到下一条标题则停止，避免把后续章节算进 bibliography。
                     if heading_flags[idx]:
                         break
-                    if paragraph_texts[idx].strip():
-                        count += 1
+                    current_text = paragraph_texts[idx].strip()
+                    if not current_text:
+                        continue
+                    count += 1
+                    if is_likely_bibliography_entry(current_text):
+                        entry_like_count += 1
+
                 inventory["bibliography_following_paragraph_count"] = count
+                inventory["bibliography_entry_like_count"] = entry_like_count
+            else:
+                # 无明确标题时，尝试根据文末条目结构推断参考文献区。
+                last_heading_index = -1
+                for idx, flag in enumerate(heading_flags):
+                    if flag:
+                        last_heading_index = idx
+
+                start_idx = max(last_heading_index + 1, int(len(paragraph_texts) * 0.6))
+                entry_like_count = 0
+                for idx in range(start_idx, len(paragraph_texts)):
+                    if heading_flags[idx]:
+                        continue
+                    current_text = paragraph_texts[idx].strip()
+                    if not current_text:
+                        continue
+                    if is_likely_bibliography_entry(current_text):
+                        entry_like_count += 1
+
+                inventory["bibliography_entry_like_count"] = entry_like_count
+                if entry_like_count >= 2:
+                    inventory["bibliography_inferred_by_entries"] = True
+                    inventory["bibliography_detection_mode"] = "entry_inference"
 
     except zipfile.BadZipFile:
         findings.append(
@@ -984,7 +1171,13 @@ def analyze_results(
     # -------------------------------------------------------------------------
     # 图题 / 表题检查
     # -------------------------------------------------------------------------
-    if expected_caption_count > 0 and docx_inventory.get("caption_count_total", 0) == 0:
+    actual_caption_count_total = int(
+        docx_inventory.get("effective_caption_count_total", docx_inventory.get("caption_count_total", 0))
+    )
+    explicit_caption_count_total = int(docx_inventory.get("caption_count_total", 0))
+    proximity_caption_count_total = int(docx_inventory.get("proximity_caption_count_total", 0))
+
+    if expected_caption_count > 0 and actual_caption_count_total == 0:
         findings.append(
             Finding(
                 severity=SEVERITY_WARN,
@@ -993,11 +1186,13 @@ def analyze_results(
                 location="document body",
                 details={
                     "expected_caption_count": expected_caption_count,
-                    "actual_caption_count_total": docx_inventory.get("caption_count_total", 0),
+                    "actual_caption_count_total": actual_caption_count_total,
+                    "explicit_caption_count_total": explicit_caption_count_total,
+                    "proximity_caption_count_total": proximity_caption_count_total,
                 },
             )
         )
-    elif expected_caption_count > 0 and docx_inventory.get("caption_count_total", 0) < expected_caption_count:
+    elif expected_caption_count > 0 and actual_caption_count_total < expected_caption_count:
         findings.append(
             Finding(
                 severity=SEVERITY_WARN,
@@ -1006,7 +1201,9 @@ def analyze_results(
                 location="document body",
                 details={
                     "expected_caption_count": expected_caption_count,
-                    "actual_caption_count_total": docx_inventory.get("caption_count_total", 0),
+                    "actual_caption_count_total": actual_caption_count_total,
+                    "explicit_caption_count_total": explicit_caption_count_total,
+                    "proximity_caption_count_total": proximity_caption_count_total,
                 },
             )
         )
@@ -1092,7 +1289,7 @@ def analyze_results(
         )
 
     # SEQ 字段是 Word caption / 编号体系的重要线索，但 Pandoc 不一定总生成。
-    if expected_caption_count > 0 and docx_inventory.get("field_seq_count", 0) == 0:
+    if expected_caption_count > 0 and actual_caption_count_total > 0 and docx_inventory.get("field_seq_count", 0) == 0:
         findings.append(
             Finding(
                 severity=SEVERITY_WARN,
@@ -1105,17 +1302,31 @@ def analyze_results(
     # -------------------------------------------------------------------------
     # 参考文献检查
     # -------------------------------------------------------------------------
-    if expected_cite_count > 0 and not docx_inventory.get("bibliography_section_found", False):
+    bibliography_detected = bool(
+        docx_inventory.get("bibliography_section_found", False) or docx_inventory.get("bibliography_inferred_by_entries", False)
+    )
+    bibliography_entry_like_count = int(docx_inventory.get("bibliography_entry_like_count", 0))
+
+    if expected_cite_count > 0 and not bibliography_detected:
         findings.append(
             Finding(
                 severity=SEVERITY_WARN,
                 code="BIBLIOGRAPHY_SECTION_NOT_DETECTED",
-                message="源文档存在文内引用，但 docx 中未检测到明确的参考文献章节标题，请重点检查文末参考文献。",
+                message="源文档存在文内引用，但 docx 中未检测到明确的参考文献章节或条目结构，请重点检查文末参考文献。",
                 location="document body",
-                details={"expected_cite_count": expected_cite_count},
+                details={
+                    "expected_cite_count": expected_cite_count,
+                    "bibliography_entry_like_count": bibliography_entry_like_count,
+                    "bibliography_detection_mode": docx_inventory.get("bibliography_detection_mode", "none"),
+                },
             )
         )
-    elif expected_cite_count > 0 and docx_inventory.get("bibliography_following_paragraph_count", 0) == 0:
+    elif (
+        expected_cite_count > 0
+        and docx_inventory.get("bibliography_section_found", False)
+        and docx_inventory.get("bibliography_following_paragraph_count", 0) == 0
+        and bibliography_entry_like_count == 0
+    ):
         findings.append(
             Finding(
                 severity=SEVERITY_WARN,
@@ -1125,6 +1336,7 @@ def analyze_results(
                 details={
                     "bibliography_heading_text": docx_inventory.get("bibliography_heading_text"),
                     "expected_cite_count": expected_cite_count,
+                    "bibliography_entry_like_count": bibliography_entry_like_count,
                 },
             )
         )
@@ -1237,6 +1449,10 @@ def analyze_results(
         "actual_heading_count": docx_inventory.get("heading_count", 0),
         "actual_math_object_count": docx_inventory.get("math_object_count", 0),
         "actual_caption_count_total": docx_inventory.get("caption_count_total", 0),
+        "actual_effective_caption_count_total": actual_caption_count_total,
+        "actual_proximity_caption_count_total": proximity_caption_count_total,
+        "bibliography_entry_like_count": bibliography_entry_like_count,
+        "bibliography_detected_by_entries": bool(docx_inventory.get("bibliography_inferred_by_entries", False)),
         "actual_internal_reference_structures": internal_reference_structures,
         "finding_error_count": error_count,
         "finding_warn_count": warn_count,

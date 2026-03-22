@@ -60,11 +60,7 @@
 *   **Python 3**
 *   **Pandoc**
 *   **Word**
-*   一个能运行 `.sh` 的 Bash 环境  
-    例如：
-    *   Git Bash
-    *   MSYS2
-    *   WSL
+*   （仅 Linux/macOS 或你想走 `.sh` 入口时）一个可运行 Bash 的环境
 
 ### 3.3 skill 目录
 
@@ -76,6 +72,7 @@ latex-to-word/
 ├─ scripts/
 │  ├─ precheck.py
 │  ├─ normalize_tex.py
+│  ├─ convert_with_pandoc.py
 │  ├─ convert_with_pandoc.sh
 │  ├─ postcheck_docx.py
 │  └─ build_manual_fix_list.py
@@ -214,10 +211,14 @@ D:\work\my-paper__latex_to_word_work
 命令：
 
 ```
-bash scripts/convert_with_pandoc.sh --work-root "D:/work/my-paper__latex_to_word_work"
+python scripts/convert_with_pandoc.py --work-root "D:/work/my-paper__latex_to_word_work"
 ```
 
-如果你在 Windows 上用的是 Git Bash，路径建议尽量写成正斜杠形式。
+Linux/macOS 也可以使用：
+
+```
+bash scripts/convert_with_pandoc.sh --work-root "D:/work/my-paper__latex_to_word_work"
+```
 
 输出文件默认在工作目录下：
 
@@ -483,7 +484,7 @@ python scripts/normalize_tex.py --project-root "D:/work/my-paper" --main-tex mai
 ### 3）主转换
 
 ```
-bash scripts/convert_with_pandoc.sh --work-root "D:/work/my-paper__latex_to_word_work"
+python scripts/convert_with_pandoc.py --work-root "D:/work/my-paper__latex_to_word_work"
 ```
 
 ### 4）后检查

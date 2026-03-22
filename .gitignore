@@ -1,8 +1,5 @@
-# 忽略所有doc文件
-*.doc
-
-# 忽略所有docx文件
-*.docx
+# 追踪样板docx文件
+!reference.docx
 
 # 忽略所有pdf文件
 *.pdf
@@ -11,8 +8,12 @@
 *.md
 
 # 追踪必要md文件
-!README.md
+!SKILL.md
+!/README.md
 !AGENTS.md
 
 # 忽略examples文件夹
 src/latex-to-word/examples/
+
+# 忽略所有doc文件夹
+doc/

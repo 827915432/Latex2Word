@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+convert_with_pandoc.py
+
+功能概述
+--------
+本脚本用于在“规范化工作副本”基础上，调用 Pandoc 完成 LaTeX -> Word (.docx)
+的主体转换。它是 Windows 11 下的原生入口，避免依赖 Bash。
+
+它解决的问题包括：
+1. 检查 Pandoc / reference.docx 等主转换依赖；
+2. 读取 normalization-report.json，确认规范化阶段没有失败；
+3. 自动确定主 TeX 文件、输出 docx 路径、参考样式模板路径；
+4. 自动收集 bibliography 文件；
+5. 自动构造 Pandoc 所需的 --resource-path；
+6. 执行 Pandoc 主转换并保存完整日志；
+7. 生成 JSON + Markdown 两份转换报告。
+
+设计边界
+--------
+本脚本只负责“主体转换”，不做以下事情：
+- 不修改原始工程；
+- 不回写规范化前的源工程；
+- 不做 docx 质量验收；
+- 不生成人工修复清单；
+- 不替代 postcheck_docx.py 的职责。
+
+依赖
+----
+- Python 3.9+
+- Pandoc
+
+典型用法
+--------
+python scripts/convert_with_pandoc.py --work-root D:/work/my-paper__latex_to_word_work
+
+或显式指定输出：
+python scripts/convert_with_pandoc.py ^
+  --work-root D:/work/my-paper__latex_to_word_work ^
+  --output-docx D:/work/my-paper__latex_to_word_work/output.docx
+
+输出
+----
+默认在 work-root 下生成：
+- output.docx
+- pandoc-conversion.log
+- pandoc-conversion-report.json
+- pandoc-conversion-report.md
+
+退出码
+------
+- 0: PASS 或 PASS_WITH_WARNINGS
+- 1: FAIL
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+STATUS_PASS = "PASS"
+STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+STATUS_FAIL = "FAIL"
+
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".bmp", ".tif", ".tiff"]
+
+
+@dataclass
+class ConversionContext:
+    work_root: Path
+    normalization_json: Path
+    main_tex: Path
+    output_docx: Path
+    reference_doc: Path
+    log_file: Path
+    report_json: Path
+    report_md: Path
+    metadata_json: Path
+    resource_dirs_txt: Path
+    bibs_txt: Path
+    normalization_status: str
+    normalization_can_continue: bool
+    tex_file_count: int
+    bibliographies: list[Path]
+    thebibliography_used: bool
+    cite_count: int
+    resource_dirs: list[Path]
+    normalization_report: dict
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run Pandoc conversion from normalized LaTeX working copy to DOCX."
+    )
+    parser.add_argument("--work-root", required=True, help="规范化工作目录。应包含 normalization-report.json。")
+    parser.add_argument("--main-tex", default=None, help="显式指定主 TeX 文件。默认从 normalization-report.json 读取。")
+    parser.add_argument(
+        "--normalization-json",
+        default=None,
+        help="规范化报告 JSON 路径。默认 <work-root>/normalization-report.json",
+    )
+    parser.add_argument("--output-docx", default=None, help="输出 docx 路径。默认 <work-root>/output.docx")
+    parser.add_argument(
+        "--reference-doc",
+        default=None,
+        help="Word 样式模板路径。默认 <skill-root>/templates/reference.docx",
+    )
+    parser.add_argument("--log-file", default=None, help="Pandoc 日志路径。默认 <work-root>/pandoc-conversion.log")
+    parser.add_argument(
+        "--report-json",
+        default=None,
+        help="转换报告 JSON 路径。默认 <work-root>/pandoc-conversion-report.json",
+    )
+    parser.add_argument(
+        "--report-md",
+        default=None,
+        help="转换报告 Markdown 路径。默认 <work-root>/pandoc-conversion-report.md",
+    )
+    return parser
+
+
+def locate_skill_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def read_text_file(path: Path) -> str:
+    encodings = ("utf-8", "utf-8-sig", "gbk", "cp936", "latin-1")
+    last_error: Optional[Exception] = None
+    for encoding in encodings:
+        try:
+            return path.read_text(encoding=encoding)
+        except Exception as exc:  # pragma: no cover - 容错回退路径
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"无法读取文件: {path}")
+
+
+def split_csv_payload(payload: str) -> list[str]:
+    return [item.strip() for item in payload.split(",") if item.strip()]
+
+
+def resolve_bib(base_dir: Path, target: str) -> Optional[Path]:
+    candidate = Path(target)
+    if candidate.suffix:
+        resolved = (base_dir / candidate).resolve()
+        return resolved if resolved.exists() else None
+    resolved = (base_dir / f"{target}.bib").resolve()
+    return resolved if resolved.exists() else None
+
+
+def collect_bibliographies_and_cites(tex_files: list[Path]) -> tuple[list[Path], bool, int]:
+    addbib_pattern = re.compile(r"\\addbibresource(?:\[[^\]]*\])?\{([^}]+)\}")
+    bibliography_pattern = re.compile(r"\\bibliography\{([^}]+)\}")
+    thebibliography_pattern = re.compile(r"\\begin\{thebibliography\}")
+    cite_pattern = re.compile(
+        r"\\(?:cite|citep|citet|parencite|textcite|autocite|footcite|supercite)\*?(?:\[[^\]]*\]){0,2}\{([^}]+)\}"
+    )
+
+    bibliographies: set[Path] = set()
+    thebibliography_used = False
+    cite_count = 0
+
+    for tex_file in tex_files:
+        try:
+            text = read_text_file(tex_file)
+        except Exception:
+            continue
+
+        if thebibliography_pattern.search(text):
+            thebibliography_used = True
+
+        cite_count += len(cite_pattern.findall(text))
+
+        for match in addbib_pattern.finditer(text):
+            target = match.group(1).strip()
+            resolved = resolve_bib(tex_file.parent, target)
+            if resolved is not None:
+                bibliographies.add(resolved)
+
+        for match in bibliography_pattern.finditer(text):
+            for target in split_csv_payload(match.group(1)):
+                resolved = resolve_bib(tex_file.parent, target)
+                if resolved is not None:
+                    bibliographies.add(resolved)
+
+    return sorted(bibliographies), thebibliography_used, cite_count
+
+
+def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
+    skill_root = locate_skill_root()
+    work_root = Path(args.work_root).resolve()
+    if not work_root.exists() or not work_root.is_dir():
+        raise RuntimeError(f"无效的工作目录: {work_root}")
+
+    normalization_json = (
+        Path(args.normalization_json).resolve()
+        if args.normalization_json
+        else (work_root / "normalization-report.json").resolve()
+    )
+    if not normalization_json.exists():
+        raise RuntimeError(f"未找到 normalization-report.json: {normalization_json}")
+
+    output_docx = Path(args.output_docx).resolve() if args.output_docx else (work_root / "output.docx").resolve()
+    reference_doc = (
+        Path(args.reference_doc).resolve()
+        if args.reference_doc
+        else (skill_root / "templates/reference.docx").resolve()
+    )
+    log_file = Path(args.log_file).resolve() if args.log_file else (work_root / "pandoc-conversion.log").resolve()
+    report_json = (
+        Path(args.report_json).resolve()
+        if args.report_json
+        else (work_root / "pandoc-conversion-report.json").resolve()
+    )
+    report_md = Path(args.report_md).resolve() if args.report_md else (work_root / "pandoc-conversion-report.md").resolve()
+
+    if not reference_doc.exists():
+        raise RuntimeError(f"未找到 reference.docx: {reference_doc}")
+
+    normalization_report = json.loads(read_text_file(normalization_json))
+    normalization_status = str(normalization_report.get("status", ""))
+    normalization_can_continue = bool(normalization_report.get("can_continue", False))
+
+    if normalization_status == STATUS_FAIL or not normalization_can_continue:
+        raise RuntimeError(
+            f"规范化阶段状态不可继续：status={normalization_status}, can_continue={normalization_can_continue}"
+        )
+
+    main_tex_arg = args.main_tex.strip() if isinstance(args.main_tex, str) else ""
+    normalized_main_tex = normalization_report.get("normalized_main_tex")
+
+    if main_tex_arg:
+        main_tex = Path(main_tex_arg)
+        if not main_tex.is_absolute():
+            main_tex = (work_root / main_tex).resolve()
+    else:
+        if not normalized_main_tex:
+            raise RuntimeError("normalization-report.json 中缺少 normalized_main_tex。")
+        main_tex = (work_root / str(normalized_main_tex)).resolve()
+
+    if not main_tex.exists():
+        raise RuntimeError(f"规范化后的主 TeX 文件不存在：{main_tex}")
+
+    tex_files: list[Path] = []
+    processed_tex = normalization_report.get("tex_files_processed") or []
+    if isinstance(processed_tex, list):
+        for rel in processed_tex:
+            candidate = (work_root / str(rel)).resolve()
+            if candidate.exists() and candidate.suffix.lower() == ".tex":
+                tex_files.append(candidate)
+    if not tex_files:
+        tex_files = sorted(work_root.rglob("*.tex"))
+
+    bibliographies, thebibliography_used, cite_count = collect_bibliographies_and_cites(tex_files)
+    resource_dirs = sorted({path.resolve() for path in work_root.rglob("*") if path.is_dir()} | {work_root.resolve()})
+
+    if cite_count > 0 and not bibliographies and not thebibliography_used:
+        raise RuntimeError("检测到文内引用，但未发现 bibliography 资源，也未发现 thebibliography 环境。")
+
+    metadata_json = (work_root / ".pandoc_metadata.json").resolve()
+    resource_dirs_txt = (work_root / ".pandoc_resource_dirs.txt").resolve()
+    bibs_txt = (work_root / ".pandoc_bibliographies.txt").resolve()
+
+    metadata_payload = {
+        "normalization_status": normalization_status,
+        "normalization_can_continue": normalization_can_continue,
+        "main_tex": str(main_tex),
+        "tex_file_count": len(tex_files),
+        "bibliography_file_count": len(bibliographies),
+        "bibliographies": [str(path) for path in bibliographies],
+        "thebibliography_used": thebibliography_used,
+        "cite_count": cite_count,
+        "resource_dir_count": len(resource_dirs),
+        "resource_dirs": [str(path) for path in resource_dirs],
+    }
+    metadata_json.write_text(json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    resource_dirs_txt.write_text("\n".join(str(path) for path in resource_dirs), encoding="utf-8")
+    bibs_txt.write_text("\n".join(str(path) for path in bibliographies), encoding="utf-8")
+
+    return ConversionContext(
+        work_root=work_root,
+        normalization_json=normalization_json,
+        main_tex=main_tex,
+        output_docx=output_docx,
+        reference_doc=reference_doc,
+        log_file=log_file,
+        report_json=report_json,
+        report_md=report_md,
+        metadata_json=metadata_json,
+        resource_dirs_txt=resource_dirs_txt,
+        bibs_txt=bibs_txt,
+        normalization_status=normalization_status,
+        normalization_can_continue=normalization_can_continue,
+        tex_file_count=len(tex_files),
+        bibliographies=bibliographies,
+        thebibliography_used=thebibliography_used,
+        cite_count=cite_count,
+        resource_dirs=resource_dirs,
+        normalization_report=normalization_report,
+    )
+
+
+def format_command_for_log(command: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(command)
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def build_pandoc_command(context: ConversionContext) -> list[str]:
+    resource_path_value = os.pathsep.join(str(path) for path in context.resource_dirs) if context.resource_dirs else str(
+        context.work_root
+    )
+
+    command: list[str] = [
+        "pandoc",
+        str(context.main_tex),
+        "--from=latex",
+        "--to=docx",
+        "--standalone",
+        f"--output={context.output_docx}",
+        f"--reference-doc={context.reference_doc}",
+        f"--resource-path={resource_path_value}",
+        "--number-sections",
+        "--toc",
+    ]
+
+    if context.bibliographies:
+        command.extend(["--citeproc", "-M", "link-citations=true"])
+        for bib in context.bibliographies:
+            command.append(f"--bibliography={bib}")
+
+    return command
+
+
+def write_log_header(context: ConversionContext, command: list[str]) -> None:
+    context.log_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "=== Pandoc Conversion Log ===",
+        f"Skill root: {locate_skill_root()}",
+        f"Work root: {context.work_root}",
+        f"Main TeX: {context.main_tex}",
+        f"Output DOCX: {context.output_docx}",
+        f"Reference DOCX: {context.reference_doc}",
+        f"Normalization JSON: {context.normalization_json}",
+        f"Bibliography file count: {len(context.bibliographies)}",
+        f"Resource dir count: {len(context.resource_dirs)}",
+        "",
+        "Command:",
+        f"  {format_command_for_log(command)}",
+        "",
+        "=== Pandoc stdout/stderr ===",
+    ]
+    context.log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_pandoc(context: ConversionContext, command: list[str]) -> int:
+    print("[INFO] 开始执行 Pandoc 主转换...")
+    with context.log_file.open("a", encoding="utf-8") as log_fp:
+        process = subprocess.Popen(
+            command,
+            cwd=str(context.work_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            log_fp.write(line)
+        return process.wait()
+
+
+def determine_status(context: ConversionContext, pandoc_exit_code: int) -> tuple[str, bool, str, list[str]]:
+    status = STATUS_PASS
+    can_continue = True
+    failure_reason = ""
+    warnings: list[str] = []
+
+    if pandoc_exit_code != 0:
+        status = STATUS_FAIL
+        can_continue = False
+        failure_reason = "pandoc_exit_nonzero"
+
+    if not context.output_docx.exists():
+        status = STATUS_FAIL
+        can_continue = False
+        failure_reason = "output_docx_missing"
+    elif context.output_docx.stat().st_size == 0:
+        status = STATUS_FAIL
+        can_continue = False
+        failure_reason = "output_docx_empty"
+
+    if (
+        status != STATUS_FAIL
+        and context.cite_count > 0
+        and len(context.bibliographies) == 0
+        and context.thebibliography_used
+    ):
+        status = STATUS_PASS_WITH_WARNINGS
+        warnings.append("检测到 thebibliography 环境；Pandoc 未启用 .bib 驱动的 citeproc，参考文献与链接效果需在后检查阶段重点核对。")
+
+    if status != STATUS_FAIL and len(context.bibliographies) == 0 and context.cite_count == 0:
+        warnings.append("未检测到 .bib bibliography 文件；若文档确实不使用引用系统，这不是问题。")
+        if status == STATUS_PASS:
+            status = STATUS_PASS_WITH_WARNINGS
+
+    if status != STATUS_FAIL and len(context.resource_dirs) > 200:
+        warnings.append("resource-path 包含的目录较多；若后续性能较差，可考虑收敛资源目录结构。")
+        if status == STATUS_PASS:
+            status = STATUS_PASS_WITH_WARNINGS
+
+    return status, can_continue, failure_reason, warnings
+
+
+def write_conversion_reports(
+    context: ConversionContext,
+    pandoc_exit_code: int,
+    status: str,
+    can_continue: bool,
+    failure_reason: str,
+    warnings: list[str],
+) -> None:
+    report = {
+        "status": status,
+        "can_continue": can_continue,
+        "work_root": str(context.work_root),
+        "main_tex": str(context.main_tex),
+        "output_docx": str(context.output_docx),
+        "reference_doc": str(context.reference_doc),
+        "normalization_json": str(context.normalization_json),
+        "pandoc_log": str(context.log_file),
+        "pandoc_exit_code": pandoc_exit_code,
+        "failure_reason": failure_reason if failure_reason else None,
+        "metrics": {
+            "bibliography_file_count": len(context.bibliographies),
+            "resource_dir_count": len(context.resource_dirs),
+            "tex_file_count": context.tex_file_count,
+            "cite_count": context.cite_count,
+        },
+        "inventory": {
+            "bibliographies": [str(path) for path in context.bibliographies],
+            "resource_dirs": [str(path) for path in context.resource_dirs],
+            "thebibliography_used": context.thebibliography_used,
+        },
+        "summary": {
+            "normalization_status": context.normalization_report.get("status"),
+            "normalization_can_continue": context.normalization_report.get("can_continue"),
+            "pandoc_exit_code": pandoc_exit_code,
+            "output_exists": context.output_docx.exists(),
+            "output_size_bytes": context.output_docx.stat().st_size if context.output_docx.exists() else 0,
+        },
+        "warnings": warnings,
+        "recommendations": [],
+    }
+
+    if status == STATUS_FAIL:
+        report["recommendations"].append("先查看 pandoc-conversion.log 中的错误信息，再修复阻塞问题后重试。")
+    else:
+        report["recommendations"].append("可进入 postcheck_docx.py 阶段，对生成的 docx 做结构级后检查。")
+
+    if len(context.bibliographies) > 0:
+        report["recommendations"].append("参考文献已作为 Pandoc 主转换输入；仍应在后检查阶段核对引用跳转与样式。")
+
+    if warnings:
+        report["recommendations"].append("存在转换告警；请在后检查和人工修复阶段重点核对这些对象。")
+
+    context.report_json.parent.mkdir(parents=True, exist_ok=True)
+    context.report_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lines = [
+        "# Pandoc Conversion Report",
+        "",
+        f"- Status: **{report['status']}**",
+        f"- Can continue: **{report['can_continue']}**",
+        f"- Work root: `{report['work_root']}`",
+        f"- Main TeX: `{report['main_tex']}`",
+        f"- Output DOCX: `{report['output_docx']}`",
+        f"- Reference DOCX: `{report['reference_doc']}`",
+        f"- Pandoc log: `{report['pandoc_log']}`",
+        "",
+        "## Summary",
+        "",
+    ]
+    for key, value in report["summary"].items():
+        lines.append(f"- {key}: **{value}**")
+
+    lines.extend(["", "## Metrics", ""])
+    for key, value in report["metrics"].items():
+        lines.append(f"- {key}: **{value}**")
+
+    lines.extend(["", "## Warnings", ""])
+    if report["warnings"]:
+        for warning in report["warnings"]:
+            lines.append(f"- {warning}")
+    else:
+        lines.append("- (none)")
+
+    lines.extend(["", "## Recommendations", ""])
+    if report["recommendations"]:
+        for recommendation in report["recommendations"]:
+            lines.append(f"- {recommendation}")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    context.report_md.parent.mkdir(parents=True, exist_ok=True)
+    context.report_md.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run() -> int:
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    if not shutil_which("pandoc"):
+        print("[ERROR] 未找到 pandoc，请先安装并确保其已加入 PATH。", file=sys.stderr)
+        return 1
+
+    try:
+        context = collect_conversion_context(args)
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    command = build_pandoc_command(context)
+    write_log_header(context, command)
+    pandoc_exit_code = run_pandoc(context, command)
+    status, can_continue, failure_reason, warnings = determine_status(context, pandoc_exit_code)
+    write_conversion_reports(
+        context=context,
+        pandoc_exit_code=pandoc_exit_code,
+        status=status,
+        can_continue=can_continue,
+        failure_reason=failure_reason,
+        warnings=warnings,
+    )
+
+    print("[INFO] Pandoc 主转换结束。")
+    print(f"[INFO] Status: {status}")
+    print(f"[INFO] Main TeX: {context.main_tex}")
+    print(f"[INFO] Output DOCX: {context.output_docx}")
+    print(f"[INFO] Log file: {context.log_file}")
+    print(f"[INFO] JSON report: {context.report_json}")
+    print(f"[INFO] Markdown report: {context.report_md}")
+
+    if status == STATUS_FAIL:
+        print(f"[ERROR] Pandoc 主转换失败。请先检查日志：{context.log_file}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def shutil_which(binary_name: str) -> Optional[str]:
+    for path in os.environ.get("PATH", "").split(os.pathsep):
+        if not path:
+            continue
+        candidate = Path(path) / binary_name
+        if candidate.exists():
+            return str(candidate)
+        if os.name == "nt":
+            exe_candidate = candidate.with_suffix(".exe")
+            if exe_candidate.exists():
+                return str(exe_candidate)
+    return None
+
+
+if __name__ == "__main__":
+    sys.exit(run())
