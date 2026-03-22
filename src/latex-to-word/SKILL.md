@@ -67,7 +67,6 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
 - `scripts/precheck.py`
 - `scripts/normalize_tex.py`
 - `scripts/convert_with_pandoc.py`
-- `scripts/convert_with_pandoc.sh`
 - `scripts/postcheck_docx.py`
 - `scripts/build_manual_fix_list.py`
 - `templates/reference.docx`
@@ -227,7 +226,7 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
 
 ---
 
-## 第三步：Pandoc 主转换（`convert_with_pandoc.py` / `convert_with_pandoc.sh`）
+## 第三步：Pandoc 主转换（`convert_with_pandoc.py`）
 
 ### 目标
 调用 Pandoc 完成从 LaTeX 到 `.docx` 的主体转换。
@@ -243,8 +242,7 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
 - 本步骤只负责主体转换，不承担全部修复责任。
 - 若发生转换错误，必须保留命令日志和错误摘要。
 - 若存在可转换但不完全保真的对象，不应因追求完美而中止全流程，除非规则文件将其列为阻塞项。
-- Win11 默认入口应使用：`python scripts/convert_with_pandoc.py --work-root <path>`
-- Linux/macOS 可使用：`bash scripts/convert_with_pandoc.sh --work-root <path>`
+- 主转换入口应使用：`python scripts/convert_with_pandoc.py --work-root <path>`
 
 ### 输出要求
 - 生成 `.docx`
@@ -331,20 +329,9 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
 - 检查 `.docx`
 - 生成最终人工修复清单
 
-## `scripts/convert_with_pandoc.sh`
-职责：
-- 只负责调用 Pandoc 完成主转换
-- 接收明确输入，产出明确 `.docx`
-- 输出转换摘要
-
-不负责：
-- 预检查规则判断
-- 规范化策略设计
-- docx 结果审校
-
 ## `scripts/convert_with_pandoc.py`
 职责：
-- 只负责调用 Pandoc 完成主转换（Windows 11 默认入口）
+- 只负责调用 Pandoc 完成主转换
 - 接收明确输入，产出明确 `.docx`
 - 输出转换摘要
 
@@ -520,8 +507,7 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
    - `scripts/normalize_tex.py`
 
 4. 然后运行：
-   - Windows 11 默认：`scripts/convert_with_pandoc.py`
-   - Linux/macOS：`scripts/convert_with_pandoc.sh`
+   - `scripts/convert_with_pandoc.py`
 
 5. 转换完成后运行：
    - `scripts/postcheck_docx.py`
