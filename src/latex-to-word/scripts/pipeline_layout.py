@@ -274,3 +274,87 @@ def stage_default_or_legacy(
 
     return staged
 
+
+def resolve_explicit_or_default(explicit_path: Optional[str], default_path: Path) -> Path:
+    """
+    解析“显式参数优先，否则默认路径”。
+    """
+    if explicit_path:
+        return Path(explicit_path).resolve()
+    return default_path.resolve()
+
+
+def resolve_explicit_or_stage_output(
+    explicit_path: Optional[str],
+    work_root: Path,
+    stage: str,
+    filename: str,
+) -> Path:
+    """
+    输出型路径解析：
+    - 显式参数优先；
+    - 否则返回 <work-root>/<stage_dir>/<filename>。
+    """
+    default_path = (stage_dir(work_root, stage) / filename).resolve()
+    return resolve_explicit_or_default(explicit_path, default_path)
+
+
+def resolve_explicit_or_stage_input(
+    explicit_path: Optional[str],
+    work_root: Path,
+    stage: str,
+    filename: str,
+    *,
+    legacy_filename: Optional[str] = None,
+) -> Path:
+    """
+    读取型路径解析：
+    - 显式参数优先；
+    - 否则按 stage_default_or_legacy 规则回退。
+    """
+    if explicit_path:
+        return Path(explicit_path).resolve()
+    return stage_default_or_legacy(
+        work_root,
+        stage,
+        filename,
+        legacy_filename=legacy_filename,
+    )
+
+
+def best_effort_update_manifest(
+    work_root: Path,
+    *,
+    stage: str,
+    status: Optional[str] = None,
+    can_continue: Optional[bool] = None,
+    artifacts: Optional[dict] = None,
+    metrics: Optional[dict] = None,
+    summary: Optional[dict] = None,
+    notes: Optional[list[str]] = None,
+    top_level_artifacts: Optional[dict[str, dict]] = None,
+) -> None:
+    """
+    以“尽力而为”方式更新 manifest：
+    - 更新阶段条目；
+    - 再按 section 更新顶层 artifacts；
+    - 任一步失败都不抛出异常，避免阻塞主流程。
+    """
+    try:
+        update_stage_manifest(
+            work_root,
+            stage,
+            status=status,
+            can_continue=can_continue,
+            artifacts=artifacts,
+            metrics=metrics,
+            summary=summary,
+            notes=notes,
+        )
+        if top_level_artifacts:
+            for section, section_artifacts in top_level_artifacts.items():
+                if section_artifacts is None:
+                    continue
+                update_manifest_artifacts(work_root, section, section_artifacts)
+    except Exception:
+        return

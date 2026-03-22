@@ -67,13 +67,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from pipeline_common import locate_skill_root, read_text_file, split_csv_payload
 from pipeline_layout import (
     STAGE_CONVERT,
     STAGE_NORMALIZE,
-    stage_default_or_legacy,
+    best_effort_update_manifest,
+    resolve_explicit_or_default,
+    resolve_explicit_or_stage_input,
+    resolve_explicit_or_stage_output,
     stage_dir,
-    update_manifest_artifacts,
-    update_stage_manifest,
 )
 
 
@@ -139,27 +141,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def locate_skill_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def read_text_file(path: Path) -> str:
-    encodings = ("utf-8", "utf-8-sig", "gbk", "cp936", "latin-1")
-    last_error: Optional[Exception] = None
-    for encoding in encodings:
-        try:
-            return path.read_text(encoding=encoding)
-        except Exception as exc:  # pragma: no cover - 容错回退路径
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(f"无法读取文件: {path}")
-
-
-def split_csv_payload(payload: str) -> list[str]:
-    return [item.strip() for item in payload.split(",") if item.strip()]
-
-
 def resolve_bib(base_dir: Path, target: str) -> Optional[Path]:
     candidate = Path(target)
     if candidate.suffix:
@@ -216,43 +197,43 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
     convert_stage_dir = stage_dir(work_root, STAGE_CONVERT)
     convert_stage_dir.mkdir(parents=True, exist_ok=True)
 
-    normalization_json = (
-        Path(args.normalization_json).resolve()
-        if args.normalization_json
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_NORMALIZE,
-            "normalization-report.json",
-            legacy_filename="normalization-report.json",
-        )
+    normalization_json = resolve_explicit_or_stage_input(
+        args.normalization_json,
+        work_root,
+        STAGE_NORMALIZE,
+        "normalization-report.json",
+        legacy_filename="normalization-report.json",
     )
     if not normalization_json.exists():
         raise RuntimeError(f"未找到 normalization-report.json: {normalization_json}")
 
-    output_docx = (
-        Path(args.output_docx).resolve()
-        if args.output_docx
-        else (convert_stage_dir / "output.docx").resolve()
+    output_docx = resolve_explicit_or_stage_output(
+        args.output_docx,
+        work_root,
+        STAGE_CONVERT,
+        "output.docx",
     )
-    reference_doc = (
-        Path(args.reference_doc).resolve()
-        if args.reference_doc
-        else (skill_root / "templates/reference.docx").resolve()
+    reference_doc = resolve_explicit_or_default(
+        args.reference_doc,
+        (skill_root / "templates/reference.docx").resolve(),
     )
-    log_file = (
-        Path(args.log_file).resolve()
-        if args.log_file
-        else (convert_stage_dir / "pandoc-conversion.log").resolve()
+    log_file = resolve_explicit_or_stage_output(
+        args.log_file,
+        work_root,
+        STAGE_CONVERT,
+        "pandoc-conversion.log",
     )
-    report_json = (
-        Path(args.report_json).resolve()
-        if args.report_json
-        else (convert_stage_dir / "pandoc-conversion-report.json").resolve()
+    report_json = resolve_explicit_or_stage_output(
+        args.report_json,
+        work_root,
+        STAGE_CONVERT,
+        "pandoc-conversion-report.json",
     )
-    report_md = (
-        Path(args.report_md).resolve()
-        if args.report_md
-        else (convert_stage_dir / "pandoc-conversion-report.md").resolve()
+    report_md = resolve_explicit_or_stage_output(
+        args.report_md,
+        work_root,
+        STAGE_CONVERT,
+        "pandoc-conversion-report.md",
     )
 
     if not reference_doc.exists():
@@ -613,67 +594,50 @@ def run() -> int:
         failure_reason=failure_reason,
         warnings=warnings,
     )
-    try:
-        update_stage_manifest(
-            context.work_root,
-            STAGE_CONVERT,
-            status=status,
-            can_continue=can_continue,
-            artifacts={
-                "output_docx": context.output_docx,
-                "pandoc_log": context.log_file,
-                "conversion_report_json": context.report_json,
-                "conversion_report_md": context.report_md,
-                "pandoc_metadata_json": context.metadata_json,
-                "pandoc_resource_dirs_txt": context.resource_dirs_txt,
-                "pandoc_bibliographies_txt": context.bibs_txt,
-                "normalized_source_root": context.normalized_source_root,
-            },
-            summary={
-                "pandoc_exit_code": pandoc_exit_code,
-                "warning_count": len(warnings),
-            },
-            metrics={
-                "tex_file_count": context.tex_file_count,
-                "bibliography_file_count": len(context.bibliographies),
-                "resource_dir_count": len(context.resource_dirs),
-                "cite_count": context.cite_count,
-            },
-            notes=warnings,
-        )
-        update_manifest_artifacts(
-            context.work_root,
-            "deliverables",
-            {
+    best_effort_update_manifest(
+        context.work_root,
+        stage=STAGE_CONVERT,
+        status=status,
+        can_continue=can_continue,
+        artifacts={
+            "output_docx": context.output_docx,
+            "pandoc_log": context.log_file,
+            "conversion_report_json": context.report_json,
+            "conversion_report_md": context.report_md,
+            "pandoc_metadata_json": context.metadata_json,
+            "pandoc_resource_dirs_txt": context.resource_dirs_txt,
+            "pandoc_bibliographies_txt": context.bibs_txt,
+            "normalized_source_root": context.normalized_source_root,
+        },
+        summary={
+            "pandoc_exit_code": pandoc_exit_code,
+            "warning_count": len(warnings),
+        },
+        metrics={
+            "tex_file_count": context.tex_file_count,
+            "bibliography_file_count": len(context.bibliographies),
+            "resource_dir_count": len(context.resource_dirs),
+            "cite_count": context.cite_count,
+        },
+        notes=warnings,
+        top_level_artifacts={
+            "deliverables": {
                 "output_docx": context.output_docx,
             },
-        )
-        update_manifest_artifacts(
-            context.work_root,
-            "reports",
-            {
+            "reports": {
                 "pandoc_conversion_report_json": context.report_json,
                 "pandoc_conversion_report_md": context.report_md,
             },
-        )
-        update_manifest_artifacts(
-            context.work_root,
-            "logs",
-            {
+            "logs": {
                 "pandoc_conversion_log": context.log_file,
             },
-        )
-        update_manifest_artifacts(
-            context.work_root,
-            "debug",
-            {
+            "debug": {
                 "pandoc_metadata_json": context.metadata_json,
                 "pandoc_resource_dirs_txt": context.resource_dirs_txt,
                 "pandoc_bibliographies_txt": context.bibs_txt,
             },
-        )
-    except Exception:
-        pass
+        },
+    )
 
     print("[INFO] Pandoc 主转换结束。")
     print(f"[INFO] Status: {status}")

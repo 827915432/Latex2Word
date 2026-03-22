@@ -62,7 +62,6 @@ python scripts/precheck.py --project-root D:/work/my-paper
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 from collections import Counter, defaultdict
@@ -70,12 +69,20 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from pipeline_common import (
+    locate_skill_root,
+    read_text_file,
+    safe_relative,
+    split_csv_payload,
+    write_json,
+    write_markdown,
+)
 from pipeline_layout import (
     STAGE_PRECHECK,
+    best_effort_update_manifest,
     default_work_root_for_project,
-    stage_dir,
-    update_manifest_artifacts,
-    update_stage_manifest,
+    resolve_explicit_or_default,
+    resolve_explicit_or_stage_output,
 )
 
 
@@ -344,39 +351,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def safe_relative(path: Path, root: Path) -> str:
-    """
-    将绝对路径尽量转换为相对于 root 的路径字符串。
-    若转换失败，则返回标准化绝对路径字符串。
-
-    这样做的目的，是让报告内容更适合用户阅读，
-    同时避免在 JSON 中混入太多冗长绝对路径。
-    """
-    try:
-        return str(path.resolve().relative_to(root.resolve()))
-    except Exception:
-        return str(path.resolve())
-
-
-def read_text_file(path: Path) -> str:
-    """
-    以 UTF-8 优先的策略读取文本文件。
-
-    说明：
-    - LaTeX 工程常见编码并不统一；
-    - 这里使用多编码回退以提高容错性；
-    - 若全部失败，再抛出异常，由上层记录为 finding。
-    """
-    encodings = ("utf-8", "utf-8-sig", "gbk", "cp936", "latin-1")
-    last_error: Optional[Exception] = None
-    for encoding in encodings:
-        try:
-            return path.read_text(encoding=encoding)
-        except Exception as exc:  # pragma: no cover - 属于容错路径
-            last_error = exc
-    raise RuntimeError(f"无法读取文件: {path}") from last_error
-
-
 def strip_latex_comments(text: str) -> str:
     """
     移除 LaTeX 注释，同时尽量保留原始行号结构。
@@ -417,23 +391,6 @@ def line_number_from_offset(text: str, offset: int) -> int:
     这里无需实现列号，因为当前 skill 的后续脚本主要只需要行级定位。
     """
     return text.count("\n", 0, offset) + 1
-
-
-def split_csv_payload(payload: str) -> list[str]:
-    """
-    解析形如 '{a,b,c}' 中的内容载荷，返回去空白后的条目列表。
-
-    用于处理：
-    - \\bibliography{a,b}
-    - \\cite{key1,key2}
-    - \\cref{fig:a,tab:b}
-    """
-    items = []
-    for item in payload.split(","):
-        token = item.strip()
-        if token:
-            items.append(token)
-    return items
 
 
 def resolve_path_with_extensions(base_dir: Path, target: str, extensions: Iterable[str]) -> Optional[Path]:
@@ -799,16 +756,6 @@ def extract_bib_keys_from_text(text: str) -> set[str]:
     return {match.group(1).strip() for match in pattern.finditer(text) if match.group(1).strip()}
 
 
-def write_json(path: Path, payload: dict) -> None:
-    """
-    写出 JSON 报告。
-
-    使用 UTF-8，确保中文报告可读。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def render_markdown_report(report: PrecheckReport) -> str:
     """
     将预检查结果渲染为 Markdown 报告。
@@ -897,29 +844,9 @@ def render_markdown_report(report: PrecheckReport) -> str:
     return "\n".join(lines)
 
 
-def write_markdown(path: Path, content: str) -> None:
-    """
-    写出 Markdown 报告。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-
 # -----------------------------------------------------------------------------
 # 核心扫描逻辑
 # -----------------------------------------------------------------------------
-
-def locate_skill_root() -> Path:
-    """
-    定位 skill 根目录。
-
-    目录约定：
-    - 本脚本位于 <skill_root>/scripts/precheck.py
-    - 因此上两级目录的父目录即为 skill 根目录
-
-    若未来目录布局变化，应修改此函数，而不是在多个地方散写路径规则。
-    """
-    return Path(__file__).resolve().parents[1]
 
 
 def check_rule_files(skill_root: Path) -> list[Finding]:
@@ -1551,18 +1478,22 @@ def main() -> int:
         return 1
 
     skill_root = locate_skill_root()
-    work_root = Path(args.work_root).resolve() if args.work_root else default_work_root_for_project(project_root)
-    precheck_stage_dir = stage_dir(work_root, STAGE_PRECHECK)
-
-    json_out = (
-        Path(args.json_out).resolve()
-        if args.json_out
-        else (precheck_stage_dir / "precheck-report.json").resolve()
+    work_root = resolve_explicit_or_default(
+        args.work_root,
+        default_work_root_for_project(project_root),
     )
-    md_out = (
-        Path(args.md_out).resolve()
-        if args.md_out
-        else (precheck_stage_dir / "precheck-report.md").resolve()
+
+    json_out = resolve_explicit_or_stage_output(
+        args.json_out,
+        work_root,
+        STAGE_PRECHECK,
+        "precheck-report.json",
+    )
+    md_out = resolve_explicit_or_stage_output(
+        args.md_out,
+        work_root,
+        STAGE_PRECHECK,
+        "precheck-report.md",
     )
 
     initial_findings: list[Finding] = []
@@ -1604,30 +1535,25 @@ def main() -> int:
         )
         write_json(json_out, asdict(report))
         write_markdown(md_out, render_markdown_report(report))
-        try:
-            update_stage_manifest(
-                work_root,
-                STAGE_PRECHECK,
-                status=report.status,
-                can_continue=report.can_continue,
-                artifacts={
+        best_effort_update_manifest(
+            work_root,
+            stage=STAGE_PRECHECK,
+            status=report.status,
+            can_continue=report.can_continue,
+            artifacts={
+                "precheck_report_json": json_out,
+                "precheck_report_md": md_out,
+                "project_root": project_root,
+            },
+            summary=report.summary,
+            metrics=report.metrics,
+            top_level_artifacts={
+                "reports": {
                     "precheck_report_json": json_out,
                     "precheck_report_md": md_out,
-                    "project_root": project_root,
-                },
-                summary=report.summary,
-                metrics=report.metrics,
-            )
-            update_manifest_artifacts(
-                work_root,
-                "reports",
-                {
-                    "precheck_report_json": json_out,
-                    "precheck_report_md": md_out,
-                },
-            )
-        except Exception:
-            pass
+                }
+            },
+        )
         print(f"[{status}] precheck failed: main TeX file could not be resolved.")
         print(f"JSON report: {json_out}")
         print(f"Markdown report: {md_out}")
@@ -1650,31 +1576,26 @@ def main() -> int:
     report_dict = asdict(report)
     write_json(json_out, report_dict)
     write_markdown(md_out, render_markdown_report(report))
-    try:
-        update_stage_manifest(
-            work_root,
-            STAGE_PRECHECK,
-            status=report.status,
-            can_continue=report.can_continue,
-            artifacts={
+    best_effort_update_manifest(
+        work_root,
+        stage=STAGE_PRECHECK,
+        status=report.status,
+        can_continue=report.can_continue,
+        artifacts={
+            "precheck_report_json": json_out,
+            "precheck_report_md": md_out,
+            "project_root": project_root,
+            "main_tex": report.main_tex,
+        },
+        summary=report.summary,
+        metrics=report.metrics,
+        top_level_artifacts={
+            "reports": {
                 "precheck_report_json": json_out,
                 "precheck_report_md": md_out,
-                "project_root": project_root,
-                "main_tex": report.main_tex,
-            },
-            summary=report.summary,
-            metrics=report.metrics,
-        )
-        update_manifest_artifacts(
-            work_root,
-            "reports",
-            {
-                "precheck_report_json": json_out,
-                "precheck_report_md": md_out,
-            },
-        )
-    except Exception:
-        pass
+            }
+        },
+    )
 
     # 向控制台打印摘要，便于 Codex / CLI / 用户快速判断。
     print(f"[{report.status}] Precheck completed.")

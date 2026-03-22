@@ -53,7 +53,6 @@ python scripts/postcheck_docx.py \
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 import zipfile
@@ -63,15 +62,23 @@ from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree as ET
 
+from pipeline_common import (
+    load_json_if_exists,
+    locate_skill_root,
+    read_text_file,
+    safe_relative,
+    write_json,
+    write_markdown,
+)
 from pipeline_layout import (
     STAGE_CONVERT,
     STAGE_NORMALIZE,
     STAGE_POSTCHECK,
     STAGE_PRECHECK,
-    stage_default_or_legacy,
+    best_effort_update_manifest,
+    resolve_explicit_or_stage_input,
+    resolve_explicit_or_stage_output,
     stage_dir,
-    update_manifest_artifacts,
-    update_stage_manifest,
 )
 
 
@@ -217,69 +224,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="后检查 Markdown 报告输出路径；默认 <work-root>/stage_postcheck/postcheck-report.md",
     )
     return parser
-
-
-def locate_skill_root() -> Path:
-    """
-    定位 skill 根目录。
-
-    当前目录约定：
-    <skill_root>/scripts/postcheck_docx.py
-    """
-    return Path(__file__).resolve().parents[1]
-
-
-def safe_relative(path: Path, root: Path) -> str:
-    """
-    将路径尽量转为相对路径字符串；若失败则返回绝对路径字符串。
-    """
-    try:
-        return str(path.resolve().relative_to(root.resolve()))
-    except Exception:
-        return str(path.resolve())
-
-
-def read_text_file(path: Path) -> str:
-    """
-    以多编码回退方式读取文本文件。
-
-    说明：
-    - 工程中的 TeX 文件和报告文件编码可能不统一；
-    - 对 JSON 报告通常应为 UTF-8，但这里仍做兼容性回退。
-    """
-    encodings = ("utf-8", "utf-8-sig", "gbk", "cp936", "latin-1")
-    last_error: Optional[Exception] = None
-    for encoding in encodings:
-        try:
-            return path.read_text(encoding=encoding)
-        except Exception as exc:  # pragma: no cover - 容错路径
-            last_error = exc
-    raise RuntimeError(f"无法读取文本文件: {path}") from last_error
-
-
-def load_json_if_exists(path: Path) -> Optional[dict]:
-    """
-    若 JSON 文件存在则读取，否则返回 None。
-    """
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_json(path: Path, payload: dict) -> None:
-    """
-    写出 JSON 报告。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def write_markdown(path: Path, content: str) -> None:
-    """
-    写出 Markdown 报告。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
 
 
 def strip_latex_comments(text: str) -> str:
@@ -1625,45 +1569,38 @@ def main() -> int:
     postcheck_stage_dir = stage_dir(work_root, STAGE_POSTCHECK)
     postcheck_stage_dir.mkdir(parents=True, exist_ok=True)
 
-    docx_path = (
-        Path(args.docx).resolve()
-        if args.docx
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_CONVERT,
-            "output.docx",
-            legacy_filename="output.docx",
-        )
+    docx_path = resolve_explicit_or_stage_input(
+        args.docx,
+        work_root,
+        STAGE_CONVERT,
+        "output.docx",
+        legacy_filename="output.docx",
     )
-    conversion_json_path = (
-        Path(args.conversion_json).resolve()
-        if args.conversion_json
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_CONVERT,
-            "pandoc-conversion-report.json",
-            legacy_filename="pandoc-conversion-report.json",
-        )
+    conversion_json_path = resolve_explicit_or_stage_input(
+        args.conversion_json,
+        work_root,
+        STAGE_CONVERT,
+        "pandoc-conversion-report.json",
+        legacy_filename="pandoc-conversion-report.json",
     )
-    normalization_json_path = (
-        Path(args.normalization_json).resolve()
-        if args.normalization_json
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_NORMALIZE,
-            "normalization-report.json",
-            legacy_filename="normalization-report.json",
-        )
+    normalization_json_path = resolve_explicit_or_stage_input(
+        args.normalization_json,
+        work_root,
+        STAGE_NORMALIZE,
+        "normalization-report.json",
+        legacy_filename="normalization-report.json",
     )
-    json_out = (
-        Path(args.json_out).resolve()
-        if args.json_out
-        else (postcheck_stage_dir / "postcheck-report.json").resolve()
+    json_out = resolve_explicit_or_stage_output(
+        args.json_out,
+        work_root,
+        STAGE_POSTCHECK,
+        "postcheck-report.json",
     )
-    md_out = (
-        Path(args.md_out).resolve()
-        if args.md_out
-        else (postcheck_stage_dir / "postcheck-report.md").resolve()
+    md_out = resolve_explicit_or_stage_output(
+        args.md_out,
+        work_root,
+        STAGE_POSTCHECK,
+        "postcheck-report.md",
     )
 
     initial_findings: list[Finding] = []
@@ -1715,7 +1652,8 @@ def main() -> int:
                 )
             )
     else:
-        candidate_in_work_root = stage_default_or_legacy(
+        candidate_in_work_root = resolve_explicit_or_stage_input(
+            None,
             work_root,
             STAGE_PRECHECK,
             "precheck-report.json",
@@ -1751,32 +1689,27 @@ def main() -> int:
     report_dict = asdict(report)
     write_json(json_out, report_dict)
     write_markdown(md_out, render_markdown_report(report))
-    try:
-        update_stage_manifest(
-            work_root,
-            STAGE_POSTCHECK,
-            status=report.status,
-            can_continue=report.can_continue,
-            artifacts={
+    best_effort_update_manifest(
+        work_root,
+        stage=STAGE_POSTCHECK,
+        status=report.status,
+        can_continue=report.can_continue,
+        artifacts={
+            "postcheck_report_json": json_out,
+            "postcheck_report_md": md_out,
+            "input_docx": docx_path,
+            "conversion_report_json": conversion_json_path,
+            "normalization_report_json": normalization_json_path,
+        },
+        summary=report.summary,
+        metrics=report.metrics,
+        top_level_artifacts={
+            "reports": {
                 "postcheck_report_json": json_out,
                 "postcheck_report_md": md_out,
-                "input_docx": docx_path,
-                "conversion_report_json": conversion_json_path,
-                "normalization_report_json": normalization_json_path,
-            },
-            summary=report.summary,
-            metrics=report.metrics,
-        )
-        update_manifest_artifacts(
-            work_root,
-            "reports",
-            {
-                "postcheck_report_json": json_out,
-                "postcheck_report_md": md_out,
-            },
-        )
-    except Exception:
-        pass
+            }
+        },
+    )
 
     # 控制台摘要。
     print(f"[{report.status}] DOCX postcheck completed.")

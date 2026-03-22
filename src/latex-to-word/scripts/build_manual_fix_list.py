@@ -63,23 +63,30 @@ python scripts/build_manual_fix_list.py --work-root D:/work/my-paper__latex_to_w
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from pipeline_common import (
+    load_json_if_exists,
+    locate_skill_root,
+    safe_relative,
+    write_json,
+    write_markdown,
+)
 from pipeline_layout import (
     STAGE_CHECKLIST,
     STAGE_CONVERT,
     STAGE_NORMALIZE,
     STAGE_POSTCHECK,
     STAGE_PRECHECK,
+    best_effort_update_manifest,
+    resolve_explicit_or_stage_input,
+    resolve_explicit_or_stage_output,
     stage_default_or_legacy,
     stage_dir,
-    update_manifest_artifacts,
-    update_stage_manifest,
 )
 
 
@@ -277,51 +284,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def locate_skill_root() -> Path:
-    """
-    定位 skill 根目录。
-
-    当前目录约定：
-    <skill_root>/scripts/build_manual_fix_list.py
-    """
-    return Path(__file__).resolve().parents[1]
-
-
-def safe_relative(path: Path, root: Path) -> str:
-    """
-    将路径尽量转为相对路径字符串；若失败则退回绝对路径。
-    """
-    try:
-        return str(path.resolve().relative_to(root.resolve()))
-    except Exception:
-        return str(path.resolve())
-
-
-def load_json_if_exists(path: Path) -> Optional[dict]:
-    """
-    若 JSON 文件存在则读取，否则返回 None。
-    """
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def write_json(path: Path, payload: dict) -> None:
-    """
-    写出 JSON 报告。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def write_markdown(path: Path, content: str) -> None:
-    """
-    写出 Markdown 报告。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-
 def check_rule_files(skill_root: Path) -> list[ChecklistItem]:
     """
     检查规则文件是否存在。
@@ -381,15 +343,12 @@ def resolve_report_paths(
     - precheck-report.json 的默认查找优先级与 postcheck 阶段一致；
     - source_project_root 用于补充“源工程目录”信息，方便报告展示。
     """
-    normalization_json_path = (
-        Path(normalization_arg).resolve()
-        if normalization_arg
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_NORMALIZE,
-            "normalization-report.json",
-            legacy_filename="normalization-report.json",
-        )
+    normalization_json_path = resolve_explicit_or_stage_input(
+        normalization_arg,
+        work_root,
+        STAGE_NORMALIZE,
+        "normalization-report.json",
+        legacy_filename="normalization-report.json",
     )
     normalization_report = load_json_if_exists(normalization_json_path)
 
@@ -397,43 +356,35 @@ def resolve_report_paths(
     if normalization_report and normalization_report.get("project_root"):
         source_project_root = Path(normalization_report["project_root"]).resolve()
 
-    conversion_json_path = (
-        Path(conversion_arg).resolve()
-        if conversion_arg
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_CONVERT,
-            "pandoc-conversion-report.json",
-            legacy_filename="pandoc-conversion-report.json",
-        )
+    conversion_json_path = resolve_explicit_or_stage_input(
+        conversion_arg,
+        work_root,
+        STAGE_CONVERT,
+        "pandoc-conversion-report.json",
+        legacy_filename="pandoc-conversion-report.json",
     )
-    postcheck_json_path = (
-        Path(postcheck_arg).resolve()
-        if postcheck_arg
-        else stage_default_or_legacy(
-            work_root,
-            STAGE_POSTCHECK,
-            "postcheck-report.json",
-            legacy_filename="postcheck-report.json",
-        )
+    postcheck_json_path = resolve_explicit_or_stage_input(
+        postcheck_arg,
+        work_root,
+        STAGE_POSTCHECK,
+        "postcheck-report.json",
+        legacy_filename="postcheck-report.json",
     )
 
-    if precheck_arg:
-        precheck_json_path = Path(precheck_arg).resolve()
+    candidate_in_work_root = resolve_explicit_or_stage_input(
+        precheck_arg,
+        work_root,
+        STAGE_PRECHECK,
+        "precheck-report.json",
+        legacy_filename="precheck-report.json",
+    )
+    if candidate_in_work_root.exists() or precheck_arg:
+        precheck_json_path = candidate_in_work_root
+    elif source_project_root is not None:
+        candidate_in_source_root = (source_project_root / "precheck-report.json").resolve()
+        precheck_json_path = candidate_in_source_root
     else:
-        candidate_in_work_root = stage_default_or_legacy(
-            work_root,
-            STAGE_PRECHECK,
-            "precheck-report.json",
-            legacy_filename="precheck-report.json",
-        )
-        if candidate_in_work_root.exists():
-            precheck_json_path = candidate_in_work_root
-        elif source_project_root is not None:
-            candidate_in_source_root = (source_project_root / "precheck-report.json").resolve()
-            precheck_json_path = candidate_in_source_root
-        else:
-            precheck_json_path = candidate_in_work_root
+        precheck_json_path = candidate_in_work_root
 
     return (
         precheck_json_path,
@@ -1792,15 +1743,17 @@ def main() -> int:
         postcheck_arg=args.postcheck_json,
     )
 
-    json_out = (
-        Path(args.json_out).resolve()
-        if args.json_out
-        else (checklist_stage_dir / "manual-fix-checklist.json").resolve()
+    json_out = resolve_explicit_or_stage_output(
+        args.json_out,
+        work_root,
+        STAGE_CHECKLIST,
+        "manual-fix-checklist.json",
     )
-    md_out = (
-        Path(args.md_out).resolve()
-        if args.md_out
-        else (checklist_stage_dir / "manual-fix-checklist.md").resolve()
+    md_out = resolve_explicit_or_stage_output(
+        args.md_out,
+        work_root,
+        STAGE_CHECKLIST,
+        "manual-fix-checklist.md",
     )
 
     precheck_report = load_json_if_exists(precheck_json_path) if precheck_json_path else None
@@ -2014,37 +1967,30 @@ def main() -> int:
     report_dict = asdict(report)
     write_json(json_out, report_dict)
     write_markdown(md_out, render_markdown_report(report))
-    try:
-        update_stage_manifest(
-            work_root,
-            STAGE_CHECKLIST,
-            status=report.status,
-            can_continue=report.can_continue,
-            artifacts={
-                "manual_fix_checklist_json": json_out,
-                "manual_fix_checklist_md": md_out,
-                "readme_run": readme_run_path if readme_run_path else None,
-            },
-            summary=report.summary,
-            metrics=report.metrics,
-            notes=report.recommendations,
-        )
-        update_manifest_artifacts(
-            work_root,
-            "reports",
-            {
-                "manual_fix_checklist_json": json_out,
-                "manual_fix_checklist_md": md_out,
-            },
-        )
-        if readme_run_path is not None:
-            update_manifest_artifacts(
-                work_root,
-                "deliverables",
-                {"readme_run": readme_run_path},
-            )
-    except Exception:
-        pass
+    top_level_artifacts = {
+        "reports": {
+            "manual_fix_checklist_json": json_out,
+            "manual_fix_checklist_md": md_out,
+        }
+    }
+    if readme_run_path is not None:
+        top_level_artifacts["deliverables"] = {"readme_run": readme_run_path}
+
+    best_effort_update_manifest(
+        work_root,
+        stage=STAGE_CHECKLIST,
+        status=report.status,
+        can_continue=report.can_continue,
+        artifacts={
+            "manual_fix_checklist_json": json_out,
+            "manual_fix_checklist_md": md_out,
+            "readme_run": readme_run_path if readme_run_path else None,
+        },
+        summary=report.summary,
+        metrics=report.metrics,
+        notes=report.recommendations,
+        top_level_artifacts=top_level_artifacts,
+    )
 
     print(f"[{report.status}] manual fix checklist generated.")
     print(f"Checklist items: {len(items)}")

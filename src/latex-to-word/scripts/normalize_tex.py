@@ -72,7 +72,6 @@ python scripts/normalize_tex.py --project-root D:/work/my-paper --force
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shutil
 import sys
@@ -81,14 +80,23 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from pipeline_common import (
+    load_json_if_exists,
+    locate_skill_root,
+    read_text_file,
+    safe_relative,
+    split_csv_payload,
+    write_json,
+    write_text_file,
+)
 from pipeline_layout import (
     STAGE_NORMALIZE,
     STAGE_PRECHECK,
+    best_effort_update_manifest,
     default_work_root_for_project,
+    resolve_explicit_or_default,
+    resolve_explicit_or_stage_input,
     stage_dir,
-    stage_default_or_legacy,
-    update_manifest_artifacts,
-    update_stage_manifest,
 )
 
 
@@ -254,67 +262,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def locate_skill_root() -> Path:
-    """
-    定位 skill 根目录。
-
-    当前目录约定：
-    <skill_root>/scripts/normalize_tex.py
-    """
-    return Path(__file__).resolve().parents[1]
-
-
-def safe_relative(path: Path, root: Path) -> str:
-    """
-    将路径尽量转为相对于 root 的相对路径字符串。
-
-    若失败，则退回绝对路径字符串。
-    """
-    try:
-        return str(path.resolve().relative_to(root.resolve()))
-    except Exception:
-        return str(path.resolve())
-
-
-def read_text_file(path: Path) -> str:
-    """
-    以多编码回退方式读取文本文件。
-
-    说明：
-    - Windows 上的 LaTeX 工程编码经常不统一；
-    - 这里优先尝试 UTF-8，再回退到常见中文编码；
-    - 最后回退到 latin-1，以尽量避免中途崩溃。
-    """
-    encodings = ("utf-8", "utf-8-sig", "gbk", "cp936", "latin-1")
-    last_error: Optional[Exception] = None
-    for encoding in encodings:
-        try:
-            return path.read_text(encoding=encoding)
-        except Exception as exc:  # pragma: no cover - 容错路径
-            last_error = exc
-    raise RuntimeError(f"无法读取文本文件: {path}") from last_error
-
-
-def write_text_file(path: Path, text: str) -> None:
-    """
-    以 UTF-8 写出文本文件。
-
-    规范化工作副本中的 .tex 文件统一写成 UTF-8，并显式使用 LF 换行，
-    以提高后续 Pandoc 与脚本处理稳定性。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-
-
-def write_json(path: Path, payload: dict) -> None:
-    """
-    写出 JSON 报告。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def line_number_from_offset(text: str, offset: int) -> int:
     """
     根据字符偏移估算行号，行号从 1 开始。
@@ -369,20 +316,6 @@ def parse_balanced_group(text: str, start: int, open_char: str, close_char: str)
     return None
 
 
-def split_csv_payload(payload: str) -> list[str]:
-    """
-    解析逗号分隔载荷，例如：
-    - bibliography{a,b}
-    - cref{fig:a,tab:b}
-    """
-    items: list[str] = []
-    for item in payload.split(","):
-        token = item.strip()
-        if token:
-            items.append(token)
-    return items
-
-
 def resolve_path_with_extensions(base_dir: Path, target: str, extensions: list[str]) -> Optional[Path]:
     """
     在给定目录下解析资源路径。
@@ -405,15 +338,6 @@ def resolve_path_with_extensions(base_dir: Path, target: str, extensions: list[s
 
     candidate = (base_dir / target_path).resolve()
     return candidate if candidate.exists() else None
-
-
-def load_json_if_exists(path: Path) -> Optional[dict]:
-    """
-    若 JSON 文件存在则读取，不存在返回 None。
-    """
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def check_rule_files(skill_root: Path) -> list[ActionRecord]:
@@ -1450,22 +1374,23 @@ def main() -> int:
         return 1
 
     skill_root = locate_skill_root()
-    work_root = Path(args.work_root).resolve() if args.work_root else default_work_root_for(project_root)
+    work_root = resolve_explicit_or_default(
+        args.work_root,
+        default_work_root_for(project_root),
+    )
     normalize_stage_dir = stage_dir(work_root, STAGE_NORMALIZE)
     precheck_stage_dir = stage_dir(work_root, STAGE_PRECHECK)
     normalized_source_root = (normalize_stage_dir / "source_snapshot").resolve()
 
-    if args.precheck_json:
-        precheck_json_path = Path(args.precheck_json).resolve()
-    else:
-        precheck_json_path = stage_default_or_legacy(
-            work_root,
-            STAGE_PRECHECK,
-            "precheck-report.json",
-            legacy_filename="precheck-report.json",
-        )
-        if not precheck_json_path.exists():
-            precheck_json_path = (project_root / "precheck-report.json").resolve()
+    precheck_json_path = resolve_explicit_or_stage_input(
+        args.precheck_json,
+        work_root,
+        STAGE_PRECHECK,
+        "precheck-report.json",
+        legacy_filename="precheck-report.json",
+    )
+    if not precheck_json_path.exists():
+        precheck_json_path = (project_root / "precheck-report.json").resolve()
     precheck_report = load_json_if_exists(precheck_json_path)
     used_precheck_report = precheck_report is not None
 
@@ -1922,31 +1847,26 @@ def main() -> int:
     write_json(json_out, asdict(report))
     write_text_file(md_out, render_markdown_report(report))
 
-    try:
-        update_stage_manifest(
-            work_root,
-            STAGE_NORMALIZE,
-            status=report.status,
-            can_continue=report.can_continue,
-            artifacts={
+    best_effort_update_manifest(
+        work_root,
+        stage=STAGE_NORMALIZE,
+        status=report.status,
+        can_continue=report.can_continue,
+        artifacts={
+            "normalization_report_json": json_out,
+            "normalization_report_md": md_out,
+            "normalized_source_root": normalized_source_root,
+            "normalized_main_tex": normalized_main_tex,
+        },
+        summary=report.summary,
+        metrics=report.metrics,
+        top_level_artifacts={
+            "reports": {
                 "normalization_report_json": json_out,
                 "normalization_report_md": md_out,
-                "normalized_source_root": normalized_source_root,
-                "normalized_main_tex": normalized_main_tex,
-            },
-            summary=report.summary,
-            metrics=report.metrics,
-        )
-        update_manifest_artifacts(
-            work_root,
-            "reports",
-            {
-                "normalization_report_json": json_out,
-                "normalization_report_md": md_out,
-            },
-        )
-    except Exception:
-        pass
+            }
+        },
+    )
 
     print(f"[{report.status}] normalization completed.")
     print(f"Source main TeX: {report.source_main_tex}")
