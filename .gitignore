@@ -9,3 +9,10 @@
 
 # 忽略所有md文件
 *.md
+
+# 追踪必要md文件
+!README.md
+!AGENTS.md
+
+# 忽略examples文件夹
+src/latex-to-word/examples/
