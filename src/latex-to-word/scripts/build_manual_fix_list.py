@@ -41,9 +41,18 @@ python scripts/build_manual_fix_list.py --work-root D:/work/my-paper__latex_to_w
 
 输出
 ----
-默认会在 work-root 下生成：
+默认会在 work-root 下生成两类结果：
+
+1) 阶段化产物（`stage_checklist/`）：
 - manual-fix-checklist.json
 - manual-fix-checklist.md
+
+2) 面向用户阅读的目录视图：
+- deliverables/
+- reports/
+- logs/
+- debug/
+- README_RUN.md
 
 退出码
 ------
@@ -55,10 +64,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from pipeline_layout import (
+    STAGE_CHECKLIST,
+    STAGE_CONVERT,
+    STAGE_NORMALIZE,
+    STAGE_POSTCHECK,
+    STAGE_PRECHECK,
+    stage_default_or_legacy,
+    stage_dir,
+    update_manifest_artifacts,
+    update_stage_manifest,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -191,6 +213,9 @@ class ManualFixChecklistReport:
     metrics: dict
     summary: dict
     recommendations: list[str]
+    user_view_generated: bool
+    user_view_root: Optional[str]
+    published_file_count: int
 
 
 # -----------------------------------------------------------------------------
@@ -217,32 +242,37 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precheck-json",
         default=None,
-        help="预检查报告 JSON 路径；默认优先 <work-root>/precheck-report.json，若不存在则尝试源工程目录。",
+        help="预检查报告 JSON 路径；默认优先 <work-root>/stage_precheck/precheck-report.json，若不存在则尝试源工程目录。",
     )
     parser.add_argument(
         "--normalization-json",
         default=None,
-        help="规范化报告 JSON 路径；默认 <work-root>/normalization-report.json",
+        help="规范化报告 JSON 路径；默认优先 <work-root>/stage_normalize/normalization-report.json",
     )
     parser.add_argument(
         "--conversion-json",
         default=None,
-        help="Pandoc 主转换报告 JSON 路径；默认 <work-root>/pandoc-conversion-report.json",
+        help="Pandoc 主转换报告 JSON 路径；默认优先 <work-root>/stage_convert/pandoc-conversion-report.json",
     )
     parser.add_argument(
         "--postcheck-json",
         default=None,
-        help="docx 后检查报告 JSON 路径；默认 <work-root>/postcheck-report.json",
+        help="docx 后检查报告 JSON 路径；默认优先 <work-root>/stage_postcheck/postcheck-report.json",
     )
     parser.add_argument(
         "--json-out",
         default=None,
-        help="清单 JSON 输出路径；默认 <work-root>/manual-fix-checklist.json",
+        help="清单 JSON 输出路径；默认 <work-root>/stage_checklist/manual-fix-checklist.json",
     )
     parser.add_argument(
         "--md-out",
         default=None,
-        help="清单 Markdown 输出路径；默认 <work-root>/manual-fix-checklist.md",
+        help="清单 Markdown 输出路径；默认 <work-root>/stage_checklist/manual-fix-checklist.md",
+    )
+    parser.add_argument(
+        "--no-user-view",
+        action="store_true",
+        help="跳过用户视图目录（deliverables/reports/logs/debug）与 README_RUN.md 的生成。",
     )
     return parser
 
@@ -354,7 +384,12 @@ def resolve_report_paths(
     normalization_json_path = (
         Path(normalization_arg).resolve()
         if normalization_arg
-        else (work_root / "normalization-report.json").resolve()
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_NORMALIZE,
+            "normalization-report.json",
+            legacy_filename="normalization-report.json",
+        )
     )
     normalization_report = load_json_if_exists(normalization_json_path)
 
@@ -365,18 +400,33 @@ def resolve_report_paths(
     conversion_json_path = (
         Path(conversion_arg).resolve()
         if conversion_arg
-        else (work_root / "pandoc-conversion-report.json").resolve()
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_CONVERT,
+            "pandoc-conversion-report.json",
+            legacy_filename="pandoc-conversion-report.json",
+        )
     )
     postcheck_json_path = (
         Path(postcheck_arg).resolve()
         if postcheck_arg
-        else (work_root / "postcheck-report.json").resolve()
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_POSTCHECK,
+            "postcheck-report.json",
+            legacy_filename="postcheck-report.json",
+        )
     )
 
     if precheck_arg:
         precheck_json_path = Path(precheck_arg).resolve()
     else:
-        candidate_in_work_root = (work_root / "precheck-report.json").resolve()
+        candidate_in_work_root = stage_default_or_legacy(
+            work_root,
+            STAGE_PRECHECK,
+            "precheck-report.json",
+            legacy_filename="precheck-report.json",
+        )
         if candidate_in_work_root.exists():
             precheck_json_path = candidate_in_work_root
         elif source_project_root is not None:
@@ -392,6 +442,270 @@ def resolve_report_paths(
         postcheck_json_path,
         source_project_root,
     )
+
+
+def _resolve_path_like(path_like: Optional[str], base_dir: Path) -> Optional[Path]:
+    """
+    将报告中的路径字段解析为绝对路径。
+
+    说明：
+    - 若 path_like 为空，返回 None；
+    - 若是相对路径，则按 base_dir 解析；
+    - 仅做路径解析，不检查是否存在。
+    """
+    if not path_like or not isinstance(path_like, str):
+        return None
+    candidate = Path(path_like)
+    if not candidate.is_absolute():
+        return (base_dir / candidate).resolve()
+    return candidate.resolve()
+
+
+def _paired_markdown_for_json(json_path: Optional[Path]) -> Optional[Path]:
+    """
+    根据 json 报告路径推断对应的 markdown 报告路径。
+    """
+    if json_path is None:
+        return None
+    return json_path.with_suffix(".md")
+
+
+def publish_user_view(
+    *,
+    work_root: Path,
+    precheck_json_path: Optional[Path],
+    normalization_json_path: Optional[Path],
+    conversion_json_path: Optional[Path],
+    postcheck_json_path: Optional[Path],
+    checklist_json_path: Path,
+    checklist_md_path: Path,
+    conversion_report: Optional[dict],
+) -> tuple[bool, Path, int, list[str]]:
+    """
+    生成面向用户阅读的目录视图。
+
+    设计原则：
+    - 不移动原文件，只复制，保持历史兼容；
+    - 目录结构固定：deliverables / reports / logs / debug；
+    - 缺失非关键文件仅记告警，不阻塞主流程。
+    """
+    user_view_root = work_root.resolve()
+    deliverables_dir = user_view_root / "deliverables"
+    reports_dir = user_view_root / "reports"
+    logs_dir = user_view_root / "logs"
+    debug_dir = user_view_root / "debug"
+
+    for folder in [deliverables_dir, reports_dir, logs_dir, debug_dir]:
+        folder.mkdir(parents=True, exist_ok=True)
+
+    warnings: list[str] = []
+    published_file_count = 0
+
+    def publish_file(src: Optional[Path], dst: Path, label: str, required: bool) -> None:
+        nonlocal published_file_count, warnings
+        if src is None:
+            if required:
+                warnings.append(f"{label}: 源路径不可用。")
+            return
+
+        resolved_src = src.resolve()
+        if not resolved_src.exists() or not resolved_src.is_file():
+            if required:
+                warnings.append(f"{label}: 未找到文件 `{resolved_src}`。")
+            return
+
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            same_file = False
+            if dst.exists():
+                try:
+                    same_file = resolved_src.samefile(dst)
+                except Exception:
+                    same_file = False
+            if not same_file:
+                shutil.copy2(str(resolved_src), str(dst))
+            published_file_count += 1
+        except Exception as exc:
+            if required:
+                warnings.append(f"{label}: 复制失败（{exc}）。")
+
+    # deliverables
+    output_docx_path = None
+    pandoc_log_path = None
+    if conversion_report and isinstance(conversion_report, dict):
+        output_docx_path = _resolve_path_like(conversion_report.get("output_docx"), work_root)
+        pandoc_log_path = _resolve_path_like(conversion_report.get("pandoc_log"), work_root)
+
+    if output_docx_path is None:
+        output_docx_path = stage_default_or_legacy(
+            work_root,
+            STAGE_CONVERT,
+            "output.docx",
+            legacy_filename="output.docx",
+        )
+    if pandoc_log_path is None:
+        pandoc_log_path = stage_default_or_legacy(
+            work_root,
+            STAGE_CONVERT,
+            "pandoc-conversion.log",
+            legacy_filename="pandoc-conversion.log",
+        )
+
+    publish_file(output_docx_path, deliverables_dir / "output.docx", "交付文档 output.docx", required=True)
+    publish_file(
+        checklist_md_path.resolve(),
+        deliverables_dir / "manual-fix-checklist.md",
+        "人工修复清单 manual-fix-checklist.md",
+        required=True,
+    )
+
+    # reports
+    precheck_md_path = _paired_markdown_for_json(precheck_json_path)
+    normalization_md_path = _paired_markdown_for_json(normalization_json_path)
+    conversion_md_path = _paired_markdown_for_json(conversion_json_path)
+    postcheck_md_path = _paired_markdown_for_json(postcheck_json_path)
+
+    publish_file(precheck_json_path, reports_dir / "precheck-report.json", "预检查报告 JSON", required=False)
+    publish_file(precheck_md_path, reports_dir / "precheck-report.md", "预检查报告 Markdown", required=False)
+
+    publish_file(
+        normalization_json_path,
+        reports_dir / "normalization-report.json",
+        "规范化报告 JSON",
+        required=False,
+    )
+    publish_file(
+        normalization_md_path,
+        reports_dir / "normalization-report.md",
+        "规范化报告 Markdown",
+        required=False,
+    )
+
+    publish_file(
+        conversion_json_path,
+        reports_dir / "pandoc-conversion-report.json",
+        "Pandoc 转换报告 JSON",
+        required=False,
+    )
+    publish_file(
+        conversion_md_path,
+        reports_dir / "pandoc-conversion-report.md",
+        "Pandoc 转换报告 Markdown",
+        required=False,
+    )
+
+    publish_file(postcheck_json_path, reports_dir / "postcheck-report.json", "后检查报告 JSON", required=False)
+    publish_file(postcheck_md_path, reports_dir / "postcheck-report.md", "后检查报告 Markdown", required=False)
+
+    publish_file(
+        checklist_json_path.resolve(),
+        reports_dir / "manual-fix-checklist.json",
+        "人工修复清单 JSON",
+        required=True,
+    )
+
+    # logs
+    publish_file(pandoc_log_path, logs_dir / "pandoc-conversion.log", "Pandoc 转换日志", required=False)
+
+    # debug（统一去掉前导点，避免影响可见性）
+    metadata_src = stage_default_or_legacy(
+        work_root,
+        STAGE_CONVERT,
+        ".pandoc_metadata.json",
+        legacy_filename=".pandoc_metadata.json",
+    )
+    resource_dirs_src = stage_default_or_legacy(
+        work_root,
+        STAGE_CONVERT,
+        ".pandoc_resource_dirs.txt",
+        legacy_filename=".pandoc_resource_dirs.txt",
+    )
+    bibs_src = stage_default_or_legacy(
+        work_root,
+        STAGE_CONVERT,
+        ".pandoc_bibliographies.txt",
+        legacy_filename=".pandoc_bibliographies.txt",
+    )
+    publish_file(
+        metadata_src,
+        debug_dir / "pandoc_metadata.json",
+        "Pandoc 元数据",
+        required=False,
+    )
+    publish_file(
+        resource_dirs_src,
+        debug_dir / "pandoc_resource_dirs.txt",
+        "Pandoc 资源目录清单",
+        required=False,
+    )
+    publish_file(
+        bibs_src,
+        debug_dir / "pandoc_bibliographies.txt",
+        "Pandoc 参考文献清单",
+        required=False,
+    )
+
+    return published_file_count > 0, user_view_root, published_file_count, warnings
+
+
+def write_run_readme(
+    *,
+    work_root: Path,
+    checklist_status: str,
+    precheck_status: str,
+    normalization_status: str,
+    conversion_status: str,
+    postcheck_status: str,
+    user_view_generated: bool,
+    published_file_count: int,
+    user_view_warnings: list[str],
+) -> Path:
+    """
+    生成用户入口说明 README_RUN.md。
+    """
+    readme_path = (work_root / "README_RUN.md").resolve()
+    lines: list[str] = []
+
+    lines.append("# 转换结果阅读入口")
+    lines.append("")
+    lines.append("## 总体状态")
+    lines.append("")
+    lines.append(f"- 人工修复清单状态：**{checklist_status}**")
+    lines.append(f"- precheck：**{precheck_status}**")
+    lines.append(f"- normalize：**{normalization_status}**")
+    lines.append(f"- pandoc convert：**{conversion_status}**")
+    lines.append(f"- postcheck：**{postcheck_status}**")
+    lines.append(f"- 用户视图目录已生成：**{user_view_generated}**")
+    lines.append(f"- 已发布文件数：**{published_file_count}**")
+    lines.append("")
+    lines.append("## 先看这些文件")
+    lines.append("")
+    lines.append("1. `deliverables/output.docx`")
+    lines.append("2. `deliverables/manual-fix-checklist.md`")
+    lines.append("")
+    lines.append("## 报告阅读顺序")
+    lines.append("")
+    lines.append("1. `reports/precheck-report.md`")
+    lines.append("2. `reports/normalization-report.md`")
+    lines.append("3. `reports/pandoc-conversion-report.md`")
+    lines.append("4. `reports/postcheck-report.md`")
+    lines.append("5. `reports/manual-fix-checklist.json`")
+    lines.append("")
+    lines.append("## 其他目录")
+    lines.append("")
+    lines.append("- `logs/`：原始转换日志")
+    lines.append("- `debug/`：Pandoc 调试辅助文件")
+    lines.append("")
+
+    if user_view_warnings:
+        lines.append("## 用户视图生成告警（非阻塞）")
+        lines.append("")
+        for warning in user_view_warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    write_markdown(readme_path, "\n".join(lines))
+    return readme_path
 
 
 # -----------------------------------------------------------------------------
@@ -1370,6 +1684,9 @@ def render_markdown_report(report: ManualFixChecklistReport) -> str:
     lines.append(f"- Used normalization report: **{report.used_normalization_report}**")
     lines.append(f"- Used conversion report: **{report.used_conversion_report}**")
     lines.append(f"- Used postcheck report: **{report.used_postcheck_report}**")
+    lines.append(f"- User view generated: **{report.user_view_generated}**")
+    lines.append(f"- User view root: `{report.user_view_root or 'N/A'}`")
+    lines.append(f"- Published file count: **{report.published_file_count}**")
     lines.append("")
 
     lines.append("## Summary")
@@ -1458,6 +1775,8 @@ def main() -> int:
         return 1
 
     skill_root = locate_skill_root()
+    checklist_stage_dir = stage_dir(work_root, STAGE_CHECKLIST)
+    checklist_stage_dir.mkdir(parents=True, exist_ok=True)
 
     (
         precheck_json_path,
@@ -1473,8 +1792,16 @@ def main() -> int:
         postcheck_arg=args.postcheck_json,
     )
 
-    json_out = Path(args.json_out).resolve() if args.json_out else (work_root / "manual-fix-checklist.json").resolve()
-    md_out = Path(args.md_out).resolve() if args.md_out else (work_root / "manual-fix-checklist.md").resolve()
+    json_out = (
+        Path(args.json_out).resolve()
+        if args.json_out
+        else (checklist_stage_dir / "manual-fix-checklist.json").resolve()
+    )
+    md_out = (
+        Path(args.md_out).resolve()
+        if args.md_out
+        else (checklist_stage_dir / "manual-fix-checklist.md").resolve()
+    )
 
     precheck_report = load_json_if_exists(precheck_json_path) if precheck_json_path else None
     normalization_report = load_json_if_exists(normalization_json_path) if normalization_json_path else None
@@ -1577,6 +1904,8 @@ def main() -> int:
         "medium_impact_count": medium_impact_count,
         "low_impact_count": low_impact_count,
         "none_impact_count": none_impact_count,
+        "user_view_generated": False,
+        "published_file_count": 0,
     }
 
     metrics = {
@@ -1590,6 +1919,8 @@ def main() -> int:
         "conversion_item_count": sum(1 for item in items if item.source_stage == "conversion"),
         "postcheck_item_count": sum(1 for item in items if item.source_stage == "postcheck"),
         "total_item_count": len(items),
+        "user_view_warning_count": 0,
+        "user_view_published_file_count": 0,
     }
 
     recommendations = build_summary_recommendations(
@@ -1618,15 +1949,110 @@ def main() -> int:
         metrics=metrics,
         summary=summary,
         recommendations=recommendations,
+        user_view_generated=False,
+        user_view_root=None,
+        published_file_count=0,
     )
 
+    # 先写一次清单文件，确保后续“用户视图发布”可以直接复用当前产物。
     report_dict = asdict(report)
     write_json(json_out, report_dict)
     write_markdown(md_out, render_markdown_report(report))
 
+    user_view_warnings: list[str] = []
+    readme_run_path: Optional[Path] = None
+    if not args.no_user_view:
+        user_view_generated, user_view_root, published_file_count, user_view_warnings = publish_user_view(
+            work_root=work_root,
+            precheck_json_path=precheck_json_path,
+            normalization_json_path=normalization_json_path,
+            conversion_json_path=conversion_json_path,
+            postcheck_json_path=postcheck_json_path,
+            checklist_json_path=json_out,
+            checklist_md_path=md_out,
+            conversion_report=conversion_report,
+        )
+
+        precheck_status = precheck_report.get("status") if precheck_report else "N/A"
+        normalization_status = normalization_report.get("status") if normalization_report else "N/A"
+        conversion_status = conversion_report.get("status") if conversion_report else "N/A"
+        postcheck_status = postcheck_report.get("status") if postcheck_report else "N/A"
+
+        readme_run_path = write_run_readme(
+            work_root=work_root,
+            checklist_status=status,
+            precheck_status=str(precheck_status),
+            normalization_status=str(normalization_status),
+            conversion_status=str(conversion_status),
+            postcheck_status=str(postcheck_status),
+            user_view_generated=user_view_generated,
+            published_file_count=published_file_count,
+            user_view_warnings=user_view_warnings,
+        )
+
+        report.user_view_generated = user_view_generated
+        report.user_view_root = str(user_view_root)
+        report.published_file_count = published_file_count
+        report.summary["user_view_generated"] = user_view_generated
+        report.summary["published_file_count"] = published_file_count
+        report.metrics["user_view_warning_count"] = len(user_view_warnings)
+        report.metrics["user_view_published_file_count"] = published_file_count
+
+        if user_view_generated:
+            report.recommendations.append("已生成用户视图目录（deliverables/reports/logs/debug），可直接按 README_RUN.md 导航阅读。")
+        else:
+            report.recommendations.append("用户视图目录未生成有效产物；请先检查上游报告与输出文件是否存在。")
+
+        if user_view_warnings:
+            report.recommendations.append(
+                f"用户视图生成时出现 {len(user_view_warnings)} 个非阻塞告警，请查看 README_RUN.md 的告警段落。"
+            )
+    else:
+        report.recommendations.append("已按参数 --no-user-view 跳过用户视图目录生成。")
+
+    # 回写最终版报告（包含用户视图生成结果）。
+    report_dict = asdict(report)
+    write_json(json_out, report_dict)
+    write_markdown(md_out, render_markdown_report(report))
+    try:
+        update_stage_manifest(
+            work_root,
+            STAGE_CHECKLIST,
+            status=report.status,
+            can_continue=report.can_continue,
+            artifacts={
+                "manual_fix_checklist_json": json_out,
+                "manual_fix_checklist_md": md_out,
+                "readme_run": readme_run_path if readme_run_path else None,
+            },
+            summary=report.summary,
+            metrics=report.metrics,
+            notes=report.recommendations,
+        )
+        update_manifest_artifacts(
+            work_root,
+            "reports",
+            {
+                "manual_fix_checklist_json": json_out,
+                "manual_fix_checklist_md": md_out,
+            },
+        )
+        if readme_run_path is not None:
+            update_manifest_artifacts(
+                work_root,
+                "deliverables",
+                {"readme_run": readme_run_path},
+            )
+    except Exception:
+        pass
+
     print(f"[{report.status}] manual fix checklist generated.")
     print(f"Checklist items: {len(items)}")
     print(f"High impact items: {high_impact_count}")
+    print(f"User view generated: {report.user_view_generated}")
+    print(f"Published file count: {report.published_file_count}")
+    if readme_run_path is not None:
+        print(f"User view README: {readme_run_path}")
     print(f"JSON report: {json_out}")
     print(f"Markdown report: {md_out}")
 

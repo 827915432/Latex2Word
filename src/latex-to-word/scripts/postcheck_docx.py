@@ -36,11 +36,11 @@ python scripts/postcheck_docx.py --work-root D:/work/my-paper__latex_to_word_wor
 或显式指定 docx：
 python scripts/postcheck_docx.py \
   --work-root D:/work/my-paper__latex_to_word_work \
-  --docx D:/work/my-paper__latex_to_word_work/output.docx
+  --docx D:/work/my-paper__latex_to_word_work/stage_convert/output.docx
 
 输出
 ----
-默认会在 work-root 下生成：
+默认会在 work-root 的 `stage_postcheck/` 下生成：
 - postcheck-report.json
 - postcheck-report.md
 
@@ -62,6 +62,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree as ET
+
+from pipeline_layout import (
+    STAGE_CONVERT,
+    STAGE_NORMALIZE,
+    STAGE_POSTCHECK,
+    STAGE_PRECHECK,
+    stage_default_or_legacy,
+    stage_dir,
+    update_manifest_artifacts,
+    update_stage_manifest,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -178,32 +189,32 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--docx",
         default=None,
-        help="待检查的 docx 文件路径；默认 <work-root>/output.docx",
+        help="待检查的 docx 文件路径；默认优先 <work-root>/stage_convert/output.docx，再回退 <work-root>/output.docx",
     )
     parser.add_argument(
         "--conversion-json",
         default=None,
-        help="Pandoc 主转换报告 JSON 路径；默认 <work-root>/pandoc-conversion-report.json",
+        help="Pandoc 主转换报告 JSON 路径；默认优先 <work-root>/stage_convert/pandoc-conversion-report.json，再回退 <work-root>/pandoc-conversion-report.json",
     )
     parser.add_argument(
         "--normalization-json",
         default=None,
-        help="规范化报告 JSON 路径；默认 <work-root>/normalization-report.json",
+        help="规范化报告 JSON 路径；默认优先 <work-root>/stage_normalize/normalization-report.json，再回退 <work-root>/normalization-report.json",
     )
     parser.add_argument(
         "--precheck-json",
         default=None,
-        help="预检查报告 JSON 路径；默认优先 <work-root>/precheck-report.json，若不存在则尝试从 normalization-report.json 中的 project_root 寻找。",
+        help="预检查报告 JSON 路径；默认优先 <work-root>/stage_precheck/precheck-report.json，再回退 <work-root>/precheck-report.json，若不存在则尝试从 normalization-report.json 中的 project_root 寻找。",
     )
     parser.add_argument(
         "--json-out",
         default=None,
-        help="后检查 JSON 报告输出路径；默认 <work-root>/postcheck-report.json",
+        help="后检查 JSON 报告输出路径；默认 <work-root>/stage_postcheck/postcheck-report.json",
     )
     parser.add_argument(
         "--md-out",
         default=None,
-        help="后检查 Markdown 报告输出路径；默认 <work-root>/postcheck-report.md",
+        help="后检查 Markdown 报告输出路径；默认 <work-root>/stage_postcheck/postcheck-report.md",
     )
     return parser
 
@@ -355,13 +366,31 @@ def collect_source_inventory(work_root: Path, normalization_report: Optional[dic
         "cite_count": 0,
     }
 
+    normalized_source_root = work_root.resolve()
+    if normalization_report and isinstance(normalization_report.get("summary"), dict):
+        value = normalization_report["summary"].get("normalized_source_root")
+        if isinstance(value, str) and value.strip():
+            candidate_root = Path(value).resolve()
+            if candidate_root.exists() and candidate_root.is_dir():
+                normalized_source_root = candidate_root
+
     tex_files: list[Path] = []
     if normalization_report and isinstance(normalization_report.get("tex_files_processed"), list):
         for relative in normalization_report["tex_files_processed"]:
-            candidate = (work_root / relative).resolve()
-            if candidate.exists() and candidate.suffix.lower() == ".tex":
-                tex_files.append(candidate)
+            rel_path = Path(str(relative))
+            candidates = []
+            if rel_path.is_absolute():
+                candidates.append(rel_path.resolve())
+            else:
+                candidates.append((normalized_source_root / rel_path).resolve())
+                candidates.append((work_root / rel_path).resolve())
+            for candidate in candidates:
+                if candidate.exists() and candidate.suffix.lower() == ".tex":
+                    tex_files.append(candidate)
+                    break
 
+    if not tex_files:
+        tex_files = sorted(normalized_source_root.rglob("*.tex"))
     if not tex_files:
         tex_files = sorted(work_root.rglob("*.tex"))
 
@@ -1593,20 +1622,49 @@ def main() -> int:
         return 1
 
     skill_root = locate_skill_root()
+    postcheck_stage_dir = stage_dir(work_root, STAGE_POSTCHECK)
+    postcheck_stage_dir.mkdir(parents=True, exist_ok=True)
 
-    docx_path = Path(args.docx).resolve() if args.docx else (work_root / "output.docx").resolve()
+    docx_path = (
+        Path(args.docx).resolve()
+        if args.docx
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_CONVERT,
+            "output.docx",
+            legacy_filename="output.docx",
+        )
+    )
     conversion_json_path = (
         Path(args.conversion_json).resolve()
         if args.conversion_json
-        else (work_root / "pandoc-conversion-report.json").resolve()
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_CONVERT,
+            "pandoc-conversion-report.json",
+            legacy_filename="pandoc-conversion-report.json",
+        )
     )
     normalization_json_path = (
         Path(args.normalization_json).resolve()
         if args.normalization_json
-        else (work_root / "normalization-report.json").resolve()
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_NORMALIZE,
+            "normalization-report.json",
+            legacy_filename="normalization-report.json",
+        )
     )
-    json_out = Path(args.json_out).resolve() if args.json_out else (work_root / "postcheck-report.json").resolve()
-    md_out = Path(args.md_out).resolve() if args.md_out else (work_root / "postcheck-report.md").resolve()
+    json_out = (
+        Path(args.json_out).resolve()
+        if args.json_out
+        else (postcheck_stage_dir / "postcheck-report.json").resolve()
+    )
+    md_out = (
+        Path(args.md_out).resolve()
+        if args.md_out
+        else (postcheck_stage_dir / "postcheck-report.md").resolve()
+    )
 
     initial_findings: list[Finding] = []
     initial_findings.extend(check_rule_files(skill_root))
@@ -1635,8 +1693,9 @@ def main() -> int:
 
     # precheck-report.json 的查找策略：
     # 1. 若用户显式指定，则直接使用；
-    # 2. 否则优先尝试 work_root/precheck-report.json；
-    # 3. 若 normalization-report.json 中存在 project_root，则再尝试 source project_root/precheck-report.json。
+    # 2. 否则优先尝试 stage_precheck/precheck-report.json；
+    # 3. 再回退 work_root/precheck-report.json；
+    # 4. 若 normalization-report.json 中存在 project_root，则再尝试 source project_root/precheck-report.json。
     precheck_report: Optional[dict] = None
     source_project_root: Optional[Path] = None
 
@@ -1656,7 +1715,12 @@ def main() -> int:
                 )
             )
     else:
-        candidate_in_work_root = (work_root / "precheck-report.json").resolve()
+        candidate_in_work_root = stage_default_or_legacy(
+            work_root,
+            STAGE_PRECHECK,
+            "precheck-report.json",
+            legacy_filename="precheck-report.json",
+        )
         precheck_report = load_json_if_exists(candidate_in_work_root)
 
         if precheck_report is None and source_project_root is not None:
@@ -1687,6 +1751,32 @@ def main() -> int:
     report_dict = asdict(report)
     write_json(json_out, report_dict)
     write_markdown(md_out, render_markdown_report(report))
+    try:
+        update_stage_manifest(
+            work_root,
+            STAGE_POSTCHECK,
+            status=report.status,
+            can_continue=report.can_continue,
+            artifacts={
+                "postcheck_report_json": json_out,
+                "postcheck_report_md": md_out,
+                "input_docx": docx_path,
+                "conversion_report_json": conversion_json_path,
+                "normalization_report_json": normalization_json_path,
+            },
+            summary=report.summary,
+            metrics=report.metrics,
+        )
+        update_manifest_artifacts(
+            work_root,
+            "reports",
+            {
+                "postcheck_report_json": json_out,
+                "postcheck_report_md": md_out,
+            },
+        )
+    except Exception:
+        pass
 
     # 控制台摘要。
     print(f"[{report.status}] DOCX postcheck completed.")

@@ -58,10 +58,10 @@ python scripts/normalize_tex.py --project-root D:/work/my-paper --force
 默认会生成一个独立工作目录，例如：
 <project-root-parent>/<project-name>__latex_to_word_work/
 
-其中包含：
-- 规范化后的工程副本
-- normalization-report.json
-- normalization-report.md
+其中包含阶段化输出：
+- `stage_normalize/source_snapshot/`（规范化后的工程副本）
+- `stage_normalize/normalization-report.json`
+- `stage_normalize/normalization-report.md`
 
 退出码
 ------
@@ -80,6 +80,16 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from pipeline_layout import (
+    STAGE_NORMALIZE,
+    STAGE_PRECHECK,
+    default_work_root_for_project,
+    stage_dir,
+    stage_default_or_legacy,
+    update_manifest_artifacts,
+    update_stage_manifest,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -229,7 +239,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precheck-json",
         default=None,
-        help="预检查 JSON 报告路径；默认使用 <project-root>/precheck-report.json。",
+        help="预检查 JSON 报告路径；默认优先 <work-root>/stage_precheck/precheck-report.json，再回退 <project-root>/precheck-report.json。",
     )
     parser.add_argument(
         "--work-root",
@@ -551,7 +561,7 @@ def default_work_root_for(project_root: Path) -> Path:
     2. 避免污染原始工程；
     3. 更容易一眼区分“源工程”和“规范化副本”。
     """
-    return (project_root.parent / f"{project_root.name}__latex_to_word_work").resolve()
+    return default_work_root_for_project(project_root)
 
 
 def ensure_work_root_is_safe(project_root: Path, work_root: Path) -> Optional[str]:
@@ -1440,12 +1450,22 @@ def main() -> int:
         return 1
 
     skill_root = locate_skill_root()
+    work_root = Path(args.work_root).resolve() if args.work_root else default_work_root_for(project_root)
+    normalize_stage_dir = stage_dir(work_root, STAGE_NORMALIZE)
+    precheck_stage_dir = stage_dir(work_root, STAGE_PRECHECK)
+    normalized_source_root = (normalize_stage_dir / "source_snapshot").resolve()
 
-    precheck_json_path = (
-        Path(args.precheck_json).resolve()
-        if args.precheck_json
-        else (project_root / "precheck-report.json").resolve()
-    )
+    if args.precheck_json:
+        precheck_json_path = Path(args.precheck_json).resolve()
+    else:
+        precheck_json_path = stage_default_or_legacy(
+            work_root,
+            STAGE_PRECHECK,
+            "precheck-report.json",
+            legacy_filename="precheck-report.json",
+        )
+        if not precheck_json_path.exists():
+            precheck_json_path = (project_root / "precheck-report.json").resolve()
     precheck_report = load_json_if_exists(precheck_json_path)
     used_precheck_report = precheck_report is not None
 
@@ -1463,11 +1483,6 @@ def main() -> int:
                 message="precheck-report.json 显示预检查失败，规范化阶段已中止。",
                 details={"precheck_status": precheck_report.get("status")},
             )
-        )
-        work_root = (
-            Path(args.work_root).resolve()
-            if args.work_root
-            else default_work_root_for(project_root)
         )
         report = NormalizationReport(
             status=STATUS_FAIL,
@@ -1497,8 +1512,8 @@ def main() -> int:
             ],
         )
 
-        json_out = work_root / "normalization-report.json"
-        md_out = work_root / "normalization-report.md"
+        json_out = normalize_stage_dir / "normalization-report.json"
+        md_out = normalize_stage_dir / "normalization-report.md"
         write_json(json_out, asdict(report))
         write_text_file(md_out, render_markdown_report(report))
 
@@ -1511,11 +1526,6 @@ def main() -> int:
     main_tex, main_actions = resolve_main_tex(project_root, args.main_tex, precheck_report)
     action_log.extend(main_actions)
     if main_tex is None:
-        work_root = (
-            Path(args.work_root).resolve()
-            if args.work_root
-            else default_work_root_for(project_root)
-        )
         report = NormalizationReport(
             status=STATUS_FAIL,
             can_continue=False,
@@ -1541,8 +1551,8 @@ def main() -> int:
             ],
         )
 
-        json_out = work_root / "normalization-report.json"
-        md_out = work_root / "normalization-report.md"
+        json_out = normalize_stage_dir / "normalization-report.json"
+        md_out = normalize_stage_dir / "normalization-report.md"
         write_json(json_out, asdict(report))
         write_text_file(md_out, render_markdown_report(report))
 
@@ -1552,7 +1562,6 @@ def main() -> int:
         return 1
 
     # 解析工作目录
-    work_root = Path(args.work_root).resolve() if args.work_root else default_work_root_for(project_root)
     safety_error = ensure_work_root_is_safe(project_root, work_root)
     if safety_error:
         action_log.append(
@@ -1589,8 +1598,8 @@ def main() -> int:
             ],
         )
 
-        json_out = work_root / "normalization-report.json"
-        md_out = work_root / "normalization-report.md"
+        json_out = normalize_stage_dir / "normalization-report.json"
+        md_out = normalize_stage_dir / "normalization-report.md"
         write_json(json_out, asdict(report))
         write_text_file(md_out, render_markdown_report(report))
 
@@ -1600,26 +1609,27 @@ def main() -> int:
         return 1
 
     # 处理已存在工作目录
-    if work_root.exists():
+    work_root.mkdir(parents=True, exist_ok=True)
+    if normalize_stage_dir.exists():
         if args.force:
-            shutil.rmtree(work_root)
+            shutil.rmtree(normalize_stage_dir)
             action_log.append(
                 ActionRecord(
-                    action_type="remove_existing_work_root",
+                    action_type="remove_existing_normalize_stage",
                     severity=SEVERITY_WARN,
-                    file=safe_relative(work_root, work_root.parent),
+                    file=safe_relative(normalize_stage_dir, work_root),
                     line=None,
-                    message="检测到已存在的工作目录，已按 --force 删除后重建。",
+                    message="检测到已存在的 normalize 阶段目录，已按 --force 删除后重建。",
                 )
             )
         else:
             action_log.append(
                 ActionRecord(
-                    action_type="work_root_already_exists",
+                    action_type="normalize_stage_already_exists",
                     severity=SEVERITY_ERROR,
-                    file=safe_relative(work_root, work_root.parent),
+                    file=safe_relative(normalize_stage_dir, work_root),
                     line=None,
-                    message="工作目录已存在；若确认可覆盖，请使用 --force。",
+                    message="normalize 阶段目录已存在；若确认可覆盖，请使用 --force。",
                 )
             )
             report = NormalizationReport(
@@ -1641,42 +1651,70 @@ def main() -> int:
                     "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
                     "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
                 },
-                summary={"status": STATUS_FAIL, "reason": "work_root_exists"},
+                summary={"status": STATUS_FAIL, "reason": "normalize_stage_exists"},
                 recommendations=[
-                    "使用 --force 允许删除旧工作目录，或改用新的 --work-root。"
+                    "使用 --force 允许删除旧的 stage_normalize，或改用新的 --work-root。"
                 ],
             )
 
-            json_out = work_root / "normalization-report.json"
-            md_out = work_root / "normalization-report.md"
+            json_out = normalize_stage_dir / "normalization-report.json"
+            md_out = normalize_stage_dir / "normalization-report.md"
             write_json(json_out, asdict(report))
             write_text_file(md_out, render_markdown_report(report))
 
-            print(f"[{report.status}] normalization failed: work root already exists.")
+            print(f"[{report.status}] normalization failed: normalize stage already exists.")
             print(f"JSON report: {json_out}")
             print(f"Markdown report: {md_out}")
             return 1
 
-    # 复制工程
-    copy_project_tree(project_root, work_root)
+    normalize_stage_dir.mkdir(parents=True, exist_ok=True)
+
+    # 复制工程到 stage_normalize/source_snapshot
+    copy_project_tree(project_root, normalized_source_root)
     action_log.append(
         ActionRecord(
             action_type="copy_project_tree",
             severity=SEVERITY_INFO,
-            file=safe_relative(work_root, work_root.parent),
+            file=safe_relative(normalized_source_root, work_root),
             line=None,
             message="已将原始工程复制到规范化工作目录。",
         )
     )
 
+    # 若 precheck 报告来自 project_root 或 legacy 路径，则在 stage_precheck 做一份镜像，便于后续阶段统一读取。
+    if precheck_report is not None:
+        try:
+            precheck_stage_dir.mkdir(parents=True, exist_ok=True)
+            staged_precheck_json = (precheck_stage_dir / "precheck-report.json").resolve()
+            staged_precheck_md = (precheck_stage_dir / "precheck-report.md").resolve()
+            write_json(staged_precheck_json, precheck_report)
+
+            source_precheck_md = precheck_json_path.with_suffix(".md")
+            if source_precheck_md.exists():
+                write_text_file(staged_precheck_md, read_text_file(source_precheck_md))
+            else:
+                write_text_file(staged_precheck_md, "# Precheck Report\n\n(原始 Markdown 报告缺失，仅保留 JSON 镜像。)\n")
+            precheck_json_path = staged_precheck_json
+        except Exception as exc:
+            action_log.append(
+                ActionRecord(
+                    action_type="mirror_precheck_to_stage_failed",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(precheck_stage_dir, work_root),
+                    line=None,
+                    message="无法将 precheck 报告镜像到 stage_precheck。",
+                    details={"error": str(exc)},
+                )
+            )
+
     # 解析规范化后主文件路径
-    normalized_main_tex = (work_root / safe_relative(main_tex, project_root)).resolve()
+    normalized_main_tex = (normalized_source_root / safe_relative(main_tex, project_root)).resolve()
     if not normalized_main_tex.exists():
         action_log.append(
             ActionRecord(
                 action_type="normalized_main_tex_missing_after_copy",
                 severity=SEVERITY_ERROR,
-                file=safe_relative(normalized_main_tex, work_root),
+                file=safe_relative(normalized_main_tex, normalized_source_root),
                 line=None,
                 message="复制完成后未在工作目录中找到主 TeX 文件。",
             )
@@ -1689,7 +1727,7 @@ def main() -> int:
             project_root=str(project_root),
             work_root=str(work_root),
             source_main_tex=safe_relative(main_tex, project_root),
-            normalized_main_tex=safe_relative(normalized_main_tex, work_root),
+            normalized_main_tex=safe_relative(normalized_main_tex, normalized_source_root),
             tex_files_processed=[],
             tex_files_processed_count=0,
             tex_files_modified_count=0,
@@ -1707,8 +1745,8 @@ def main() -> int:
             ],
         )
 
-        json_out = work_root / "normalization-report.json"
-        md_out = work_root / "normalization-report.md"
+        json_out = normalize_stage_dir / "normalization-report.json"
+        md_out = normalize_stage_dir / "normalization-report.md"
         write_json(json_out, asdict(report))
         write_text_file(md_out, render_markdown_report(report))
 
@@ -1718,13 +1756,13 @@ def main() -> int:
         return 1
 
     # 收集目标 TeX 文件
-    target_tex_files = collect_target_tex_files(project_root, work_root, precheck_report)
+    target_tex_files = collect_target_tex_files(project_root, normalized_source_root, precheck_report)
     if not target_tex_files:
         action_log.append(
             ActionRecord(
                 action_type="no_target_tex_files",
                 severity=SEVERITY_ERROR,
-                file=safe_relative(work_root, work_root),
+                file=safe_relative(normalized_source_root, work_root),
                 line=None,
                 message="工作目录中没有可供规范化的 TeX 文件。",
             )
@@ -1737,7 +1775,7 @@ def main() -> int:
             project_root=str(project_root),
             work_root=str(work_root),
             source_main_tex=safe_relative(main_tex, project_root),
-            normalized_main_tex=safe_relative(normalized_main_tex, work_root),
+            normalized_main_tex=safe_relative(normalized_main_tex, normalized_source_root),
             tex_files_processed=[],
             tex_files_processed_count=0,
             tex_files_modified_count=0,
@@ -1755,8 +1793,8 @@ def main() -> int:
             ],
         )
 
-        json_out = work_root / "normalization-report.json"
-        md_out = work_root / "normalization-report.md"
+        json_out = normalize_stage_dir / "normalization-report.json"
+        md_out = normalize_stage_dir / "normalization-report.md"
         write_json(json_out, asdict(report))
         write_text_file(md_out, render_markdown_report(report))
 
@@ -1766,7 +1804,7 @@ def main() -> int:
         return 1
 
     # 收集零参数安全宏
-    macros, macro_actions = collect_zero_arg_macros(target_tex_files, work_root)
+    macros, macro_actions = collect_zero_arg_macros(target_tex_files, normalized_source_root)
     action_log.extend(macro_actions)
 
     # 逐文件规范化
@@ -1775,13 +1813,13 @@ def main() -> int:
 
     for tex_file in target_tex_files:
         try:
-            modified, file_actions = process_tex_file(tex_file, work_root, macros)
+            modified, file_actions = process_tex_file(tex_file, normalized_source_root, macros)
             action_log.extend(file_actions)
 
             actions_by_type = Counter(action.action_type for action in file_actions)
             file_summaries.append(
                 FileSummary(
-                    file=safe_relative(tex_file, work_root),
+                    file=safe_relative(tex_file, normalized_source_root),
                     modified=modified,
                     action_count=len(file_actions),
                     actions_by_type=dict(sorted(actions_by_type.items())),
@@ -1795,7 +1833,7 @@ def main() -> int:
                 ActionRecord(
                     action_type="process_tex_file_failed",
                     severity=SEVERITY_ERROR,
-                    file=safe_relative(tex_file, work_root),
+                    file=safe_relative(tex_file, normalized_source_root),
                     line=None,
                     message="规范化该 TeX 文件时发生异常。",
                     details={"error": str(exc)},
@@ -1803,7 +1841,7 @@ def main() -> int:
             )
             file_summaries.append(
                 FileSummary(
-                    file=safe_relative(tex_file, work_root),
+                    file=safe_relative(tex_file, normalized_source_root),
                     modified=False,
                     action_count=0,
                     actions_by_type={},
@@ -1852,8 +1890,8 @@ def main() -> int:
         project_root=str(project_root),
         work_root=str(work_root),
         source_main_tex=safe_relative(main_tex, project_root),
-        normalized_main_tex=safe_relative(normalized_main_tex, work_root),
-        tex_files_processed=[safe_relative(path, work_root) for path in target_tex_files],
+        normalized_main_tex=safe_relative(normalized_main_tex, normalized_source_root),
+        tex_files_processed=[safe_relative(path, normalized_source_root) for path in target_tex_files],
         tex_files_processed_count=len(target_tex_files),
         tex_files_modified_count=modified_count,
         actions=[asdict(action) for action in action_log],
@@ -1873,15 +1911,42 @@ def main() -> int:
             "can_continue": can_continue,
             "used_precheck_report": used_precheck_report,
             "source_main_tex": safe_relative(main_tex, project_root),
-            "normalized_main_tex": safe_relative(normalized_main_tex, work_root),
+            "normalized_main_tex": safe_relative(normalized_main_tex, normalized_source_root),
+            "normalized_source_root": str(normalized_source_root),
         },
         recommendations=recommendations,
     )
 
-    json_out = work_root / "normalization-report.json"
-    md_out = work_root / "normalization-report.md"
+    json_out = normalize_stage_dir / "normalization-report.json"
+    md_out = normalize_stage_dir / "normalization-report.md"
     write_json(json_out, asdict(report))
     write_text_file(md_out, render_markdown_report(report))
+
+    try:
+        update_stage_manifest(
+            work_root,
+            STAGE_NORMALIZE,
+            status=report.status,
+            can_continue=report.can_continue,
+            artifacts={
+                "normalization_report_json": json_out,
+                "normalization_report_md": md_out,
+                "normalized_source_root": normalized_source_root,
+                "normalized_main_tex": normalized_main_tex,
+            },
+            summary=report.summary,
+            metrics=report.metrics,
+        )
+        update_manifest_artifacts(
+            work_root,
+            "reports",
+            {
+                "normalization_report_json": json_out,
+                "normalization_report_md": md_out,
+            },
+        )
+    except Exception:
+        pass
 
     print(f"[{report.status}] normalization completed.")
     print(f"Source main TeX: {report.source_main_tex}")
@@ -1892,6 +1957,7 @@ def main() -> int:
     print(f"Warnings: {report.metrics['warn_count']}")
     print(f"Infos: {report.metrics['info_count']}")
     print(f"Work root: {work_root}")
+    print(f"Normalized source root: {normalized_source_root}")
     print(f"JSON report: {json_out}")
     print(f"Markdown report: {md_out}")
 

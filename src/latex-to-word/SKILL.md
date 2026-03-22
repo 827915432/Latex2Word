@@ -129,10 +129,13 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
 - 是否允许覆盖已有输出文件
 - 是否允许在工程目录旁创建中间工作目录
 
-如用户未明确输出路径，默认输出到当前工程目录下，文件名可使用：
-- `output.docx`
-- `conversion-report.md`
-- `manual-fix-checklist.md`
+如用户未明确输出路径，默认输出到 `work-root`（通常为 `<project-root-parent>/<project-name>__latex_to_word_work/`）：
+- `stage_precheck/precheck-report.{json,md}`
+- `stage_normalize/normalization-report.{json,md}`
+- `stage_convert/output.docx`
+- `stage_convert/pandoc-conversion-report.{json,md}`
+- `stage_postcheck/postcheck-report.{json,md}`
+- `stage_checklist/manual-fix-checklist.{json,md}`
 
 如用户未明确主文件，则应在工程目录中优先识别最可能的主文件，但不得凭空编造文件名。
 
@@ -143,15 +146,23 @@ description: 将结构化 LaTeX 工程高保真转换为 Word（docx）的技能
 本 skill 的标准输出至少包括以下三类结果：
 
 1. Word 文档
-   - 例如：`output.docx`
+   - 例如：`stage_convert/output.docx`
 
 2. 转换报告
-   - 例如：`conversion-report.md`
+   - 例如：`stage_precheck/precheck-report.md`、`stage_normalize/normalization-report.md`、`stage_convert/pandoc-conversion-report.md`、`stage_postcheck/postcheck-report.md`
    - 应包含预检查摘要、规范化摘要、Pandoc 转换摘要、后检查摘要、降级项清单
 
 3. 人工修复清单
-   - 例如：`manual-fix-checklist.md`
+   - 例如：`stage_checklist/manual-fix-checklist.md`
    - 应包含必须人工检查或修复的对象列表与建议修复顺序
+
+此外，`build_manual_fix_list.py` 默认会在 `work-root` 生成面向用户阅读的目录视图：
+- `deliverables/`：面向交付的核心文件（如 `output.docx`、`manual-fix-checklist.md`）
+- `reports/`：各阶段结构化报告（`.md` + `.json`）
+- `logs/`：转换日志
+- `debug/`：调试辅助文件
+- `README_RUN.md`：推荐阅读顺序与关键入口
+- `run-manifest.json`：阶段状态、关键产物路径与布局元数据
 
 如果主转换失败，则至少输出：
 - 失败原因说明

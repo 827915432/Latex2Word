@@ -38,11 +38,11 @@ python scripts/convert_with_pandoc.py --work-root D:/work/my-paper__latex_to_wor
 或显式指定输出：
 python scripts/convert_with_pandoc.py ^
   --work-root D:/work/my-paper__latex_to_word_work ^
-  --output-docx D:/work/my-paper__latex_to_word_work/output.docx
+  --output-docx D:/work/my-paper__latex_to_word_work/stage_convert/output.docx
 
 输出
 ----
-默认在 work-root 下生成：
+默认在 work-root 的 `stage_convert/` 下生成：
 - output.docx
 - pandoc-conversion.log
 - pandoc-conversion-report.json
@@ -66,6 +66,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from pipeline_layout import (
+    STAGE_CONVERT,
+    STAGE_NORMALIZE,
+    stage_default_or_legacy,
+    stage_dir,
+    update_manifest_artifacts,
+    update_stage_manifest,
+)
 
 
 STATUS_PASS = "PASS"
@@ -96,6 +105,7 @@ class ConversionContext:
     cite_count: int
     resource_dirs: list[Path]
     normalization_report: dict
+    normalized_source_root: Path
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -107,24 +117,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--normalization-json",
         default=None,
-        help="规范化报告 JSON 路径。默认 <work-root>/normalization-report.json",
+        help="规范化报告 JSON 路径。默认优先 <work-root>/stage_normalize/normalization-report.json，再回退 <work-root>/normalization-report.json",
     )
-    parser.add_argument("--output-docx", default=None, help="输出 docx 路径。默认 <work-root>/output.docx")
+    parser.add_argument("--output-docx", default=None, help="输出 docx 路径。默认 <work-root>/stage_convert/output.docx")
     parser.add_argument(
         "--reference-doc",
         default=None,
         help="Word 样式模板路径。默认 <skill-root>/templates/reference.docx",
     )
-    parser.add_argument("--log-file", default=None, help="Pandoc 日志路径。默认 <work-root>/pandoc-conversion.log")
+    parser.add_argument("--log-file", default=None, help="Pandoc 日志路径。默认 <work-root>/stage_convert/pandoc-conversion.log")
     parser.add_argument(
         "--report-json",
         default=None,
-        help="转换报告 JSON 路径。默认 <work-root>/pandoc-conversion-report.json",
+        help="转换报告 JSON 路径。默认 <work-root>/stage_convert/pandoc-conversion-report.json",
     )
     parser.add_argument(
         "--report-md",
         default=None,
-        help="转换报告 Markdown 路径。默认 <work-root>/pandoc-conversion-report.md",
+        help="转换报告 Markdown 路径。默认 <work-root>/stage_convert/pandoc-conversion-report.md",
     )
     return parser
 
@@ -203,27 +213,47 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
     if not work_root.exists() or not work_root.is_dir():
         raise RuntimeError(f"无效的工作目录: {work_root}")
 
+    convert_stage_dir = stage_dir(work_root, STAGE_CONVERT)
+    convert_stage_dir.mkdir(parents=True, exist_ok=True)
+
     normalization_json = (
         Path(args.normalization_json).resolve()
         if args.normalization_json
-        else (work_root / "normalization-report.json").resolve()
+        else stage_default_or_legacy(
+            work_root,
+            STAGE_NORMALIZE,
+            "normalization-report.json",
+            legacy_filename="normalization-report.json",
+        )
     )
     if not normalization_json.exists():
         raise RuntimeError(f"未找到 normalization-report.json: {normalization_json}")
 
-    output_docx = Path(args.output_docx).resolve() if args.output_docx else (work_root / "output.docx").resolve()
+    output_docx = (
+        Path(args.output_docx).resolve()
+        if args.output_docx
+        else (convert_stage_dir / "output.docx").resolve()
+    )
     reference_doc = (
         Path(args.reference_doc).resolve()
         if args.reference_doc
         else (skill_root / "templates/reference.docx").resolve()
     )
-    log_file = Path(args.log_file).resolve() if args.log_file else (work_root / "pandoc-conversion.log").resolve()
+    log_file = (
+        Path(args.log_file).resolve()
+        if args.log_file
+        else (convert_stage_dir / "pandoc-conversion.log").resolve()
+    )
     report_json = (
         Path(args.report_json).resolve()
         if args.report_json
-        else (work_root / "pandoc-conversion-report.json").resolve()
+        else (convert_stage_dir / "pandoc-conversion-report.json").resolve()
     )
-    report_md = Path(args.report_md).resolve() if args.report_md else (work_root / "pandoc-conversion-report.md").resolve()
+    report_md = (
+        Path(args.report_md).resolve()
+        if args.report_md
+        else (convert_stage_dir / "pandoc-conversion-report.md").resolve()
+    )
 
     if not reference_doc.exists():
         raise RuntimeError(f"未找到 reference.docx: {reference_doc}")
@@ -237,17 +267,39 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
             f"规范化阶段状态不可继续：status={normalization_status}, can_continue={normalization_can_continue}"
         )
 
+    normalized_source_root = None
+    if isinstance(normalization_report.get("summary"), dict):
+        normalized_source_root_value = normalization_report["summary"].get("normalized_source_root")
+        if isinstance(normalized_source_root_value, str) and normalized_source_root_value.strip():
+            normalized_source_root = Path(normalized_source_root_value).resolve()
+
+    if normalized_source_root is None:
+        candidate_source_root = (stage_dir(work_root, STAGE_NORMALIZE) / "source_snapshot").resolve()
+        if candidate_source_root.exists():
+            normalized_source_root = candidate_source_root
+        else:
+            normalized_source_root = work_root
+
     main_tex_arg = args.main_tex.strip() if isinstance(args.main_tex, str) else ""
     normalized_main_tex = normalization_report.get("normalized_main_tex")
 
     if main_tex_arg:
         main_tex = Path(main_tex_arg)
         if not main_tex.is_absolute():
-            main_tex = (work_root / main_tex).resolve()
+            main_tex = (normalized_source_root / main_tex).resolve()
     else:
         if not normalized_main_tex:
             raise RuntimeError("normalization-report.json 中缺少 normalized_main_tex。")
-        main_tex = (work_root / str(normalized_main_tex)).resolve()
+        main_tex_candidate = Path(str(normalized_main_tex))
+        if main_tex_candidate.is_absolute():
+            main_tex = main_tex_candidate.resolve()
+        else:
+            main_tex = (normalized_source_root / main_tex_candidate).resolve()
+            if not main_tex.exists():
+                # 兼容历史版本 normalization-report（相对 work_root）。
+                legacy_main_tex = (work_root / main_tex_candidate).resolve()
+                if legacy_main_tex.exists():
+                    main_tex = legacy_main_tex
 
     if not main_tex.exists():
         raise RuntimeError(f"规范化后的主 TeX 文件不存在：{main_tex}")
@@ -256,21 +308,34 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
     processed_tex = normalization_report.get("tex_files_processed") or []
     if isinstance(processed_tex, list):
         for rel in processed_tex:
-            candidate = (work_root / str(rel)).resolve()
-            if candidate.exists() and candidate.suffix.lower() == ".tex":
-                tex_files.append(candidate)
+            rel_path = Path(str(rel))
+            candidates = []
+            if rel_path.is_absolute():
+                candidates.append(rel_path.resolve())
+            else:
+                candidates.append((normalized_source_root / rel_path).resolve())
+                candidates.append((work_root / rel_path).resolve())
+            for candidate in candidates:
+                if candidate.exists() and candidate.suffix.lower() == ".tex":
+                    tex_files.append(candidate)
+                    break
+    if not tex_files:
+        tex_files = sorted(normalized_source_root.rglob("*.tex"))
     if not tex_files:
         tex_files = sorted(work_root.rglob("*.tex"))
 
     bibliographies, thebibliography_used, cite_count = collect_bibliographies_and_cites(tex_files)
-    resource_dirs = sorted({path.resolve() for path in work_root.rglob("*") if path.is_dir()} | {work_root.resolve()})
+    resource_dirs = sorted(
+        {path.resolve() for path in normalized_source_root.rglob("*") if path.is_dir()}
+        | {normalized_source_root.resolve()}
+    )
 
     if cite_count > 0 and not bibliographies and not thebibliography_used:
         raise RuntimeError("检测到文内引用，但未发现 bibliography 资源，也未发现 thebibliography 环境。")
 
-    metadata_json = (work_root / ".pandoc_metadata.json").resolve()
-    resource_dirs_txt = (work_root / ".pandoc_resource_dirs.txt").resolve()
-    bibs_txt = (work_root / ".pandoc_bibliographies.txt").resolve()
+    metadata_json = (convert_stage_dir / ".pandoc_metadata.json").resolve()
+    resource_dirs_txt = (convert_stage_dir / ".pandoc_resource_dirs.txt").resolve()
+    bibs_txt = (convert_stage_dir / ".pandoc_bibliographies.txt").resolve()
 
     metadata_payload = {
         "normalization_status": normalization_status,
@@ -283,6 +348,7 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         "cite_count": cite_count,
         "resource_dir_count": len(resource_dirs),
         "resource_dirs": [str(path) for path in resource_dirs],
+        "normalized_source_root": str(normalized_source_root),
     }
     metadata_json.write_text(json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     resource_dirs_txt.write_text("\n".join(str(path) for path in resource_dirs), encoding="utf-8")
@@ -308,6 +374,7 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         cite_count=cite_count,
         resource_dirs=resource_dirs,
         normalization_report=normalization_report,
+        normalized_source_root=normalized_source_root,
     )
 
 
@@ -369,7 +436,7 @@ def run_pandoc(context: ConversionContext, command: list[str]) -> int:
     with context.log_file.open("a", encoding="utf-8") as log_fp:
         process = subprocess.Popen(
             command,
-            cwd=str(context.work_root),
+            cwd=str(context.normalized_source_root),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -546,6 +613,67 @@ def run() -> int:
         failure_reason=failure_reason,
         warnings=warnings,
     )
+    try:
+        update_stage_manifest(
+            context.work_root,
+            STAGE_CONVERT,
+            status=status,
+            can_continue=can_continue,
+            artifacts={
+                "output_docx": context.output_docx,
+                "pandoc_log": context.log_file,
+                "conversion_report_json": context.report_json,
+                "conversion_report_md": context.report_md,
+                "pandoc_metadata_json": context.metadata_json,
+                "pandoc_resource_dirs_txt": context.resource_dirs_txt,
+                "pandoc_bibliographies_txt": context.bibs_txt,
+                "normalized_source_root": context.normalized_source_root,
+            },
+            summary={
+                "pandoc_exit_code": pandoc_exit_code,
+                "warning_count": len(warnings),
+            },
+            metrics={
+                "tex_file_count": context.tex_file_count,
+                "bibliography_file_count": len(context.bibliographies),
+                "resource_dir_count": len(context.resource_dirs),
+                "cite_count": context.cite_count,
+            },
+            notes=warnings,
+        )
+        update_manifest_artifacts(
+            context.work_root,
+            "deliverables",
+            {
+                "output_docx": context.output_docx,
+            },
+        )
+        update_manifest_artifacts(
+            context.work_root,
+            "reports",
+            {
+                "pandoc_conversion_report_json": context.report_json,
+                "pandoc_conversion_report_md": context.report_md,
+            },
+        )
+        update_manifest_artifacts(
+            context.work_root,
+            "logs",
+            {
+                "pandoc_conversion_log": context.log_file,
+            },
+        )
+        update_manifest_artifacts(
+            context.work_root,
+            "debug",
+            {
+                "pandoc_metadata_json": context.metadata_json,
+                "pandoc_resource_dirs_txt": context.resource_dirs_txt,
+                "pandoc_bibliographies_txt": context.bibs_txt,
+            },
+        )
+    except Exception:
+        pass
 
     print("[INFO] Pandoc 主转换结束。")
     print(f"[INFO] Status: {status}")

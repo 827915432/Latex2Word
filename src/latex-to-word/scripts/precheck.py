@@ -46,9 +46,12 @@ python scripts/precheck.py --project-root D:/work/my-paper
 
 输出
 ----
-默认会在 project-root 下生成：
+默认会在 work-root 的 `stage_precheck/` 下生成：
 - precheck-report.json
 - precheck-report.md
+
+若未显式传入 `--work-root`，默认 work-root 为：
+`<project-root-parent>/<project-name>__latex_to_word_work/`
 
 退出码
 ------
@@ -66,6 +69,14 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
+
+from pipeline_layout import (
+    STAGE_PRECHECK,
+    default_work_root_for_project,
+    stage_dir,
+    update_manifest_artifacts,
+    update_stage_manifest,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -316,14 +327,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="主 TeX 文件路径。可为相对 project-root 的路径；若不提供，将自动识别。",
     )
     parser.add_argument(
+        "--work-root",
+        default=None,
+        help="流水线工作目录；默认 <project-root-parent>/<project-name>__latex_to_word_work。",
+    )
+    parser.add_argument(
         "--json-out",
         default=None,
-        help="JSON 报告输出路径；默认输出到 <project-root>/precheck-report.json",
+        help="JSON 报告输出路径；默认输出到 <work-root>/stage_precheck/precheck-report.json",
     )
     parser.add_argument(
         "--md-out",
         default=None,
-        help="Markdown 报告输出路径；默认输出到 <project-root>/precheck-report.md",
+        help="Markdown 报告输出路径；默认输出到 <work-root>/stage_precheck/precheck-report.md",
     )
     return parser
 
@@ -1535,9 +1551,19 @@ def main() -> int:
         return 1
 
     skill_root = locate_skill_root()
+    work_root = Path(args.work_root).resolve() if args.work_root else default_work_root_for_project(project_root)
+    precheck_stage_dir = stage_dir(work_root, STAGE_PRECHECK)
 
-    json_out = Path(args.json_out).resolve() if args.json_out else (project_root / "precheck-report.json").resolve()
-    md_out = Path(args.md_out).resolve() if args.md_out else (project_root / "precheck-report.md").resolve()
+    json_out = (
+        Path(args.json_out).resolve()
+        if args.json_out
+        else (precheck_stage_dir / "precheck-report.json").resolve()
+    )
+    md_out = (
+        Path(args.md_out).resolve()
+        if args.md_out
+        else (precheck_stage_dir / "precheck-report.md").resolve()
+    )
 
     initial_findings: list[Finding] = []
 
@@ -1578,6 +1604,30 @@ def main() -> int:
         )
         write_json(json_out, asdict(report))
         write_markdown(md_out, render_markdown_report(report))
+        try:
+            update_stage_manifest(
+                work_root,
+                STAGE_PRECHECK,
+                status=report.status,
+                can_continue=report.can_continue,
+                artifacts={
+                    "precheck_report_json": json_out,
+                    "precheck_report_md": md_out,
+                    "project_root": project_root,
+                },
+                summary=report.summary,
+                metrics=report.metrics,
+            )
+            update_manifest_artifacts(
+                work_root,
+                "reports",
+                {
+                    "precheck_report_json": json_out,
+                    "precheck_report_md": md_out,
+                },
+            )
+        except Exception:
+            pass
         print(f"[{status}] precheck failed: main TeX file could not be resolved.")
         print(f"JSON report: {json_out}")
         print(f"Markdown report: {md_out}")
@@ -1600,10 +1650,36 @@ def main() -> int:
     report_dict = asdict(report)
     write_json(json_out, report_dict)
     write_markdown(md_out, render_markdown_report(report))
+    try:
+        update_stage_manifest(
+            work_root,
+            STAGE_PRECHECK,
+            status=report.status,
+            can_continue=report.can_continue,
+            artifacts={
+                "precheck_report_json": json_out,
+                "precheck_report_md": md_out,
+                "project_root": project_root,
+                "main_tex": report.main_tex,
+            },
+            summary=report.summary,
+            metrics=report.metrics,
+        )
+        update_manifest_artifacts(
+            work_root,
+            "reports",
+            {
+                "precheck_report_json": json_out,
+                "precheck_report_md": md_out,
+            },
+        )
+    except Exception:
+        pass
 
     # 向控制台打印摘要，便于 Codex / CLI / 用户快速判断。
     print(f"[{report.status}] Precheck completed.")
     print(f"Main TeX: {report.main_tex}")
+    print(f"Work root: {work_root}")
     print(f"Scanned TeX files: {report.scanned_tex_file_count}")
     print(f"Errors: {report.metrics.get('finding_error_count', 0)}")
     print(f"Warnings: {report.metrics.get('finding_warn_count', 0)}")
