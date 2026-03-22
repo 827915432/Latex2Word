@@ -1,0 +1,1902 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+normalize_tex.py
+
+功能概述
+--------
+本脚本用于在 LaTeX -> Word 主转换之前，对 LaTeX 工程执行“保守规范化”。
+
+它解决的问题包括：
+1. 绝不覆盖原始工程，而是在独立工作目录中生成规范化副本；
+2. 对确定性高、低风险的写法做标准化，降低 Pandoc 主转换的不稳定性；
+3. 为后续步骤保留一份可追踪的“我改了什么、为什么改、改到了哪里”的报告。
+
+本脚本当前实现的规范化动作
+--------------------------
+1. 复制原始工程到独立工作目录；
+2. 统一文本文件换行风格为 LF（仅作用于工作副本中的 .tex 文件）；
+3. 为 \\includegraphics 中缺失扩展名的图片路径补全实际扩展名；
+4. 为 \\addbibresource / \\bibliography 中的 bibliography 资源补全 .bib 扩展名；
+5. 将常见扩展交叉引用命令做保守降级：
+   - \\autoref{...} -> \\ref{...}
+   - \\cref{a,b} / \\Cref{a,b} -> \\ref{a}, \\ref{b}
+6. 在 figure / table 环境中，当检测到“\\label 紧邻且位于 \\caption 前”时，
+   将其调整为“\\caption 后紧跟 \\label”；
+7. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
+   - 支持 \\newcommand / \\renewcommand / \\providecommand
+   - 仅展开零参数、短小、无参数占位符的定义
+   - 不覆盖原定义，只在正文使用位置做文本替换
+8. 生成结构化 JSON 报告与 Markdown 报告。
+
+设计边界
+--------
+本脚本刻意不做以下事情：
+1. 不改写正文语义；
+2. 不重构章节结构；
+3. 不删除用户内容；
+4. 不做激进宏展开；
+5. 不尝试自动修复复杂 TikZ、复杂表格、复杂 theorem 系统；
+6. 不直接调用 Pandoc；
+7. 不修改原始工程。
+
+依赖
+----
+- Python 3.9+
+- 仅使用标准库，不依赖第三方包
+
+典型用法
+--------
+python scripts/normalize_tex.py --project-root D:/work/my-paper --main-tex main.tex --force
+
+或依赖 precheck-report.json 自动获取主文件：
+
+python scripts/normalize_tex.py --project-root D:/work/my-paper --force
+
+输出
+----
+默认会生成一个独立工作目录，例如：
+<project-root-parent>/<project-name>__latex_to_word_work/
+
+其中包含：
+- 规范化后的工程副本
+- normalization-report.json
+- normalization-report.md
+
+退出码
+------
+- 0: 成功生成规范化工作副本
+- 1: 失败
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import sys
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+# -----------------------------------------------------------------------------
+# 常量定义
+# -----------------------------------------------------------------------------
+
+STATUS_PASS = "PASS"
+STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+STATUS_FAIL = "FAIL"
+
+SEVERITY_INFO = "INFO"
+SEVERITY_WARN = "WARN"
+SEVERITY_ERROR = "ERROR"
+
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".bmp", ".tif", ".tiff"]
+BIB_EXTENSIONS = [".bib"]
+
+# 默认忽略复制的目录/文件名。
+# 这些内容对 LaTeX -> Word 主流程没有帮助，反而会污染工作副本。
+DEFAULT_COPY_IGNORE_NAMES = {
+    ".git",
+    ".idea",
+    ".vscode",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".DS_Store",
+}
+
+# 规则文件存在性检查；normalize 阶段不解析其内容，但需要尽早发现 skill 目录不完整。
+REQUIRED_RULE_FILES = [
+    "rules/supported_envs.md",
+    "rules/downgrade_policy.md",
+    "rules/acceptance_criteria.md",
+]
+
+
+# -----------------------------------------------------------------------------
+# 数据结构定义
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ActionRecord:
+    """
+    表示一次实际发生的规范化动作。
+
+    字段说明
+    --------
+    action_type:
+        稳定、机器可读的动作类型，例如：
+        - normalize_newlines
+        - add_graphics_extension
+        - normalize_autoref
+        - expand_zero_arg_macro
+
+    severity:
+        规范化动作的性质：
+        - INFO: 常规安全规范化
+        - WARN: 带有降级含义或需后续重点检查的规范化
+        - ERROR: 仅用于记录导致该文件无法正常处理的情况
+
+    file:
+        目标文件，相对工程根目录或工作根目录的相对路径字符串。
+
+    line:
+        近似行号。由于规范化过程中内容可能移动，行号只要求“足够用于人工定位”。
+
+    message:
+        面向人的简短说明。
+
+    details:
+        结构化补充信息，供 JSON 报告和后续脚本消费。
+    """
+    action_type: str
+    severity: str
+    file: str
+    line: Optional[int]
+    message: str
+    details: dict = field(default_factory=dict)
+
+
+@dataclass
+class FileSummary:
+    """
+    单个 TeX 文件的规范化摘要。
+    """
+    file: str
+    modified: bool
+    action_count: int
+    actions_by_type: dict
+
+
+@dataclass
+class NormalizationReport:
+    """
+    规范化阶段的最终报告对象。
+
+    设计目标：
+    - 既方便 JSON 结构化消费，也方便 Markdown 渲染；
+    - 清楚说明是否使用了 precheck 结果；
+    - 清楚说明工作副本在哪里；
+    - 清楚说明实际改写了哪些文件、做了哪些动作。
+    """
+    status: str
+    can_continue: bool
+    used_precheck_report: bool
+    project_root: str
+    work_root: str
+    source_main_tex: Optional[str]
+    normalized_main_tex: Optional[str]
+    tex_files_processed: list[str]
+    tex_files_processed_count: int
+    tex_files_modified_count: int
+    actions: list[dict]
+    file_summaries: list[dict]
+    metrics: dict
+    summary: dict
+    recommendations: list[str]
+
+
+# -----------------------------------------------------------------------------
+# 通用工具函数
+# -----------------------------------------------------------------------------
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    """
+    构造命令行参数解析器。
+
+    参数设计原则：
+    - 只暴露规范化阶段真正需要的输入；
+    - 默认行为稳定、保守；
+    - 不引入与当前职责无关的参数。
+    """
+    parser = argparse.ArgumentParser(
+        description="Create a normalized LaTeX working copy for LaTeX -> Word conversion."
+    )
+    parser.add_argument(
+        "--project-root",
+        required=True,
+        help="原始 LaTeX 工程根目录。",
+    )
+    parser.add_argument(
+        "--main-tex",
+        default=None,
+        help="主 TeX 文件路径；可为相对 project-root 的路径。若不提供，优先从 precheck-report.json 读取。",
+    )
+    parser.add_argument(
+        "--precheck-json",
+        default=None,
+        help="预检查 JSON 报告路径；默认使用 <project-root>/precheck-report.json。",
+    )
+    parser.add_argument(
+        "--work-root",
+        default=None,
+        help="规范化工作目录；默认生成到 <project-root-parent>/<project-name>__latex_to_word_work。",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="若工作目录已存在，则先删除再重建。默认不覆盖。",
+    )
+    return parser
+
+
+def locate_skill_root() -> Path:
+    """
+    定位 skill 根目录。
+
+    当前目录约定：
+    <skill_root>/scripts/normalize_tex.py
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def safe_relative(path: Path, root: Path) -> str:
+    """
+    将路径尽量转为相对于 root 的相对路径字符串。
+
+    若失败，则退回绝对路径字符串。
+    """
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except Exception:
+        return str(path.resolve())
+
+
+def read_text_file(path: Path) -> str:
+    """
+    以多编码回退方式读取文本文件。
+
+    说明：
+    - Windows 上的 LaTeX 工程编码经常不统一；
+    - 这里优先尝试 UTF-8，再回退到常见中文编码；
+    - 最后回退到 latin-1，以尽量避免中途崩溃。
+    """
+    encodings = ("utf-8", "utf-8-sig", "gbk", "cp936", "latin-1")
+    last_error: Optional[Exception] = None
+    for encoding in encodings:
+        try:
+            return path.read_text(encoding=encoding)
+        except Exception as exc:  # pragma: no cover - 容错路径
+            last_error = exc
+    raise RuntimeError(f"无法读取文本文件: {path}") from last_error
+
+
+def write_text_file(path: Path, text: str) -> None:
+    """
+    以 UTF-8 写出文本文件。
+
+    规范化工作副本中的 .tex 文件统一写成 UTF-8，并显式使用 LF 换行，
+    以提高后续 Pandoc 与脚本处理稳定性。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def write_json(path: Path, payload: dict) -> None:
+    """
+    写出 JSON 报告。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def line_number_from_offset(text: str, offset: int) -> int:
+    """
+    根据字符偏移估算行号，行号从 1 开始。
+    """
+    return text.count("\n", 0, offset) + 1
+
+
+def skip_whitespace(text: str, pos: int) -> int:
+    """
+    跳过从 pos 开始的空白字符，返回新的位置索引。
+    """
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+def parse_balanced_group(text: str, start: int, open_char: str, close_char: str) -> Optional[int]:
+    """
+    解析从 start 开始的配对分组，返回“分组结束后一个字符”的位置。
+
+    参数要求：
+    - text[start] 必须等于 open_char
+    - 采用简单栈计数
+    - 对反斜杠转义做最基础处理
+
+    示例：
+    text = "{abc{d}}"
+    start = 0
+    返回值 = len(text)
+
+    注意：
+    这里不是完整 TeX 解析器，但对 caption / label / macro body 这类常见结构足够。
+    """
+    if start >= len(text) or text[start] != open_char:
+        return None
+
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            # 跳过转义后的单个字符，避免误把 \{ 或 \} 当作分组边界。
+            i += 2
+            continue
+        if ch == open_char:
+            depth += 1
+        elif ch == close_char:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def split_csv_payload(payload: str) -> list[str]:
+    """
+    解析逗号分隔载荷，例如：
+    - bibliography{a,b}
+    - cref{fig:a,tab:b}
+    """
+    items: list[str] = []
+    for item in payload.split(","):
+        token = item.strip()
+        if token:
+            items.append(token)
+    return items
+
+
+def resolve_path_with_extensions(base_dir: Path, target: str, extensions: list[str]) -> Optional[Path]:
+    """
+    在给定目录下解析资源路径。
+
+    规则：
+    1. 若 target 自带后缀，则直接检查；
+    2. 若 target 无后缀，则按 extensions 依次补全；
+    3. 若仍不存在，则返回 None。
+    """
+    target_path = Path(target)
+
+    if target_path.suffix:
+        candidate = (base_dir / target_path).resolve()
+        return candidate if candidate.exists() else None
+
+    for ext in extensions:
+        candidate = (base_dir / f"{target}{ext}").resolve()
+        if candidate.exists():
+            return candidate
+
+    candidate = (base_dir / target_path).resolve()
+    return candidate if candidate.exists() else None
+
+
+def load_json_if_exists(path: Path) -> Optional[dict]:
+    """
+    若 JSON 文件存在则读取，不存在返回 None。
+    """
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def check_rule_files(skill_root: Path) -> list[ActionRecord]:
+    """
+    检查规则文件是否存在。
+
+    normalize 阶段不会解析规则文件内容，但若 skill 目录损坏，应尽早通过报告暴露。
+    """
+    actions: list[ActionRecord] = []
+    for relative in REQUIRED_RULE_FILES:
+        candidate = (skill_root / relative).resolve()
+        if not candidate.exists():
+            actions.append(
+                ActionRecord(
+                    action_type="missing_rule_file",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(candidate, skill_root),
+                    line=None,
+                    message="缺少规则文件；后续流程行为可能不完整。",
+                    details={"required_file": relative},
+                )
+            )
+    return actions
+
+
+# -----------------------------------------------------------------------------
+# 主文件与工作目录解析
+# -----------------------------------------------------------------------------
+
+def resolve_main_tex(
+    project_root: Path,
+    main_tex_arg: Optional[str],
+    precheck_report: Optional[dict],
+) -> tuple[Optional[Path], list[ActionRecord]]:
+    """
+    解析主 TeX 文件，优先级如下：
+    1. 命令行参数 --main-tex
+    2. precheck-report.json 中的 main_tex
+    3. 常见主文件名启发式：main.tex
+    4. 含 \\documentclass 与 \\begin{document} 的 .tex 文件
+
+    返回：
+    - 主文件绝对路径或 None
+    - 附加动作记录（主要是告警/信息）
+    """
+    actions: list[ActionRecord] = []
+
+    if main_tex_arg:
+        candidate = Path(main_tex_arg)
+        if not candidate.is_absolute():
+            candidate = (project_root / candidate).resolve()
+        if not candidate.exists():
+            actions.append(
+                ActionRecord(
+                    action_type="resolve_main_tex_failed",
+                    severity=SEVERITY_ERROR,
+                    file=safe_relative(candidate, project_root),
+                    line=None,
+                    message="指定的主 TeX 文件不存在。",
+                    details={"source": "cli_argument"},
+                )
+            )
+            return None, actions
+        return candidate.resolve(), actions
+
+    if precheck_report and precheck_report.get("main_tex"):
+        candidate = (project_root / precheck_report["main_tex"]).resolve()
+        if candidate.exists():
+            actions.append(
+                ActionRecord(
+                    action_type="resolve_main_tex_from_precheck",
+                    severity=SEVERITY_INFO,
+                    file=safe_relative(candidate, project_root),
+                    line=None,
+                    message="主 TeX 文件来自 precheck-report.json。",
+                    details={"source": "precheck_report"},
+                )
+            )
+            return candidate, actions
+
+    main_candidate = (project_root / "main.tex").resolve()
+    if main_candidate.exists():
+        actions.append(
+            ActionRecord(
+                action_type="resolve_main_tex_by_name",
+                severity=SEVERITY_WARN,
+                file=safe_relative(main_candidate, project_root),
+                line=None,
+                message="未显式提供主文件，已按常见命名约定选择 main.tex。",
+                details={"source": "heuristic_main_tex_name"},
+            )
+        )
+        return main_candidate, actions
+
+    tex_files = sorted(project_root.rglob("*.tex"))
+    best_score = -1
+    best_path: Optional[Path] = None
+    for tex_file in tex_files:
+        try:
+            text = read_text_file(tex_file)
+        except Exception:
+            continue
+        score = 0
+        if re.search(r"\\documentclass(?:\[[^\]]*\])?\{[^}]+\}", text):
+            score += 5
+        if r"\begin{document}" in text:
+            score += 5
+        if score > best_score:
+            best_score = score
+            best_path = tex_file.resolve()
+
+    if best_path is not None and best_score > 0:
+        actions.append(
+            ActionRecord(
+                action_type="resolve_main_tex_by_content",
+                severity=SEVERITY_WARN,
+                file=safe_relative(best_path, project_root),
+                line=None,
+                message="未显式提供主文件，已按文档结构启发式自动选择主文件。",
+                details={"source": "heuristic_document_structure"},
+            )
+        )
+        return best_path, actions
+
+    actions.append(
+        ActionRecord(
+            action_type="resolve_main_tex_failed",
+            severity=SEVERITY_ERROR,
+            file=safe_relative(project_root, project_root),
+            line=None,
+            message="无法确定主 TeX 文件，请显式传入 --main-tex 或先运行 precheck.py。",
+            details={"source": "all_failed"},
+        )
+    )
+    return None, actions
+
+
+def default_work_root_for(project_root: Path) -> Path:
+    """
+    计算默认工作目录。
+
+    采用“工程同级目录”的形式，而不是把工作副本放进工程目录内部，
+    原因如下：
+    1. 避免递归复制自身；
+    2. 避免污染原始工程；
+    3. 更容易一眼区分“源工程”和“规范化副本”。
+    """
+    return (project_root.parent / f"{project_root.name}__latex_to_word_work").resolve()
+
+
+def ensure_work_root_is_safe(project_root: Path, work_root: Path) -> Optional[str]:
+    """
+    检查工作目录是否安全。
+
+    安全要求：
+    - 不能与 project_root 相同；
+    - 不建议位于 project_root 内部，否则复制过程会递归污染；
+    - 也不能让 project_root 位于 work_root 内部导致覆盖混乱。
+
+    返回：
+    - 若安全，返回 None
+    - 若不安全，返回错误消息
+    """
+    project_root_resolved = project_root.resolve()
+    work_root_resolved = work_root.resolve()
+
+    if project_root_resolved == work_root_resolved:
+        return "工作目录不能与原始工程目录相同。"
+
+    # work_root 不能位于 project_root 内部
+    try:
+        work_root_resolved.relative_to(project_root_resolved)
+        return "工作目录不能位于原始工程目录内部，否则复制过程可能递归污染工程。"
+    except ValueError:
+        pass
+
+    # project_root 不能位于 work_root 内部
+    try:
+        project_root_resolved.relative_to(work_root_resolved)
+        return "原始工程目录不能位于工作目录内部。"
+    except ValueError:
+        pass
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# 复制与目标文件选择
+# -----------------------------------------------------------------------------
+
+def copy_project_tree(project_root: Path, work_root: Path) -> None:
+    """
+    将原始工程复制到工作目录。
+
+    实现说明：
+    - 使用 shutil.copytree 保持目录结构；
+    - 忽略常见缓存目录与开发环境目录；
+    - 不在这里做任何内容修改，只负责复制。
+    """
+    def ignore_func(_src: str, names: list[str]) -> set[str]:
+        ignored = set()
+        for name in names:
+            if name in DEFAULT_COPY_IGNORE_NAMES:
+                ignored.add(name)
+        return ignored
+
+    shutil.copytree(project_root, work_root, ignore=ignore_func, copy_function=shutil.copy2)
+
+
+def collect_target_tex_files(
+    project_root: Path,
+    work_root: Path,
+    precheck_report: Optional[dict],
+) -> list[Path]:
+    """
+    确定需要进行规范化处理的 TeX 文件集合。
+
+    优先策略：
+    1. 若 precheck-report.json 中存在 scanned_tex_files，则只处理主文件可达闭包；
+    2. 否则处理工作副本中所有 .tex 文件。
+
+    这样设计的原因：
+    - 优先尊重 precheck 阶段已经确定的“有效输入闭包”；
+    - 在没有 precheck 时，也保证脚本具备独立工作能力。
+    """
+    targets: list[Path] = []
+
+    if precheck_report and isinstance(precheck_report.get("scanned_tex_files"), list):
+        for relative in precheck_report["scanned_tex_files"]:
+            candidate = (work_root / relative).resolve()
+            if candidate.exists() and candidate.suffix.lower() == ".tex":
+                targets.append(candidate)
+
+    if targets:
+        return sorted(set(targets))
+
+    return sorted(work_root.rglob("*.tex"))
+
+
+# -----------------------------------------------------------------------------
+# 自定义命令收集与安全展开
+# -----------------------------------------------------------------------------
+
+@dataclass
+class MacroDefinition:
+    """
+    表示一个可安全展开的零参数宏定义。
+    """
+    name: str
+    replacement: str
+    defined_in: str
+    line: int
+
+
+def collect_zero_arg_macros_from_text(text: str, file_path: Path, project_root: Path) -> tuple[dict[str, MacroDefinition], list[ActionRecord]]:
+    """
+    从单个 TeX 文件中收集“可安全展开”的零参数宏定义。
+
+    支持的定义来源：
+    - \\newcommand
+    - \\renewcommand
+    - \\providecommand
+
+    只接受如下安全条件：
+    1. 宏名规范；
+    2. 参数个数为 0 或未显式给出；
+    3. replacement 中不含 # 占位符；
+    4. replacement 长度适中；
+    5. 不含可选默认参数这类高风险结构。
+
+    为什么如此保守：
+    - 规范化阶段不应成为一个“宏编译器”；
+    - 目标只是稳定主转换，不是重实现 TeX 宏系统。
+    """
+    macros: dict[str, MacroDefinition] = {}
+    actions: list[ActionRecord] = []
+
+    definition_head = re.compile(r"\\(?:newcommand|renewcommand|providecommand)\*?")
+
+    pos = 0
+    while True:
+        match = definition_head.search(text, pos)
+        if not match:
+            break
+
+        cursor = match.end()
+        cursor = skip_whitespace(text, cursor)
+
+        # 解析宏名。
+        macro_name: Optional[str] = None
+        if cursor < len(text) and text[cursor] == "{":
+            end = parse_balanced_group(text, cursor, "{", "}")
+            if end is not None:
+                inner = text[cursor + 1:end - 1].strip()
+                if re.fullmatch(r"\\[A-Za-z@]+", inner):
+                    macro_name = inner[1:]
+                cursor = end
+            else:
+                cursor += 1
+        elif cursor < len(text) and text[cursor] == "\\":
+            name_match = re.match(r"\\([A-Za-z@]+)", text[cursor:])
+            if name_match:
+                macro_name = name_match.group(1)
+                cursor += len(name_match.group(0))
+
+        if not macro_name:
+            pos = match.end()
+            continue
+
+        cursor = skip_whitespace(text, cursor)
+
+        # 解析可选参数个数 [n]
+        arg_count = 0
+        if cursor < len(text) and text[cursor] == "[":
+            arg_end = parse_balanced_group(text, cursor, "[", "]")
+            if arg_end is None:
+                pos = match.end()
+                continue
+            arg_payload = text[cursor + 1:arg_end - 1].strip()
+            if arg_payload.isdigit():
+                arg_count = int(arg_payload)
+                cursor = arg_end
+            else:
+                # 形如 [default] 或其他复杂写法，直接视为高风险，跳过展开。
+                line_no = line_number_from_offset(text, match.start())
+                actions.append(
+                    ActionRecord(
+                        action_type="skip_complex_macro_definition",
+                        severity=SEVERITY_WARN,
+                        file=safe_relative(file_path, project_root),
+                        line=line_no,
+                        message="跳过带复杂可选参数的自定义命令定义。",
+                        details={"macro_name": macro_name},
+                    )
+                )
+                pos = match.end()
+                continue
+
+        cursor = skip_whitespace(text, cursor)
+
+        # 若紧跟第二个 []，说明这是“带默认参数值”的定义，风险较高，跳过。
+        if cursor < len(text) and text[cursor] == "[":
+            line_no = line_number_from_offset(text, match.start())
+            actions.append(
+                ActionRecord(
+                    action_type="skip_macro_with_default_argument",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(file_path, project_root),
+                    line=line_no,
+                    message="跳过带默认参数值的自定义命令定义。",
+                    details={"macro_name": macro_name},
+                )
+            )
+            pos = match.end()
+            continue
+
+        cursor = skip_whitespace(text, cursor)
+
+        # 解析 replacement body
+        if cursor >= len(text) or text[cursor] != "{":
+            pos = match.end()
+            continue
+        body_end = parse_balanced_group(text, cursor, "{", "}")
+        if body_end is None:
+            pos = match.end()
+            continue
+
+        replacement = text[cursor + 1:body_end - 1]
+        line_no = line_number_from_offset(text, match.start())
+
+        if arg_count == 0 and "#" not in replacement and len(replacement) <= 200:
+            macros[macro_name] = MacroDefinition(
+                name=macro_name,
+                replacement=replacement,
+                defined_in=safe_relative(file_path, project_root),
+                line=line_no,
+            )
+            actions.append(
+                ActionRecord(
+                    action_type="collect_safe_zero_arg_macro",
+                    severity=SEVERITY_INFO,
+                    file=safe_relative(file_path, project_root),
+                    line=line_no,
+                    message="收集到可安全展开的零参数宏定义。",
+                    details={"macro_name": macro_name},
+                )
+            )
+        else:
+            actions.append(
+                ActionRecord(
+                    action_type="skip_nonzero_or_complex_macro_definition",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(file_path, project_root),
+                    line=line_no,
+                    message="跳过非零参数或不安全的自定义命令定义。",
+                    details={
+                        "macro_name": macro_name,
+                        "arg_count": arg_count,
+                        "contains_parameter_marker": "#" in replacement,
+                        "replacement_length": len(replacement),
+                    },
+                )
+            )
+
+        pos = body_end
+
+    return macros, actions
+
+
+def collect_zero_arg_macros(tex_files: list[Path], project_root: Path) -> tuple[dict[str, MacroDefinition], list[ActionRecord]]:
+    """
+    从所有目标 TeX 文件中收集可安全展开的零参数宏。
+
+    策略：
+    - 后定义覆盖先定义；
+    - 若同名宏在多个文件中出现，以后者为准，并记录覆盖行为。
+    """
+    macros: dict[str, MacroDefinition] = {}
+    actions: list[ActionRecord] = []
+
+    for tex_file in tex_files:
+        try:
+            text = read_text_file(tex_file)
+        except Exception as exc:
+            actions.append(
+                ActionRecord(
+                    action_type="read_tex_failed_for_macro_scan",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(tex_file, project_root),
+                    line=None,
+                    message="宏扫描时无法读取 TeX 文件，已跳过该文件。",
+                    details={"error": str(exc)},
+                )
+            )
+            continue
+
+        file_macros, file_actions = collect_zero_arg_macros_from_text(text, tex_file, project_root)
+        actions.extend(file_actions)
+
+        for name, definition in file_macros.items():
+            if name in macros:
+                actions.append(
+                    ActionRecord(
+                        action_type="override_safe_zero_arg_macro",
+                        severity=SEVERITY_WARN,
+                        file=definition.defined_in,
+                        line=definition.line,
+                        message="后续文件中的同名零参数宏覆盖了先前定义。",
+                        details={
+                            "macro_name": name,
+                            "previous_defined_in": macros[name].defined_in,
+                            "previous_line": macros[name].line,
+                        },
+                    )
+                )
+            macros[name] = definition
+
+    return macros, actions
+
+
+# -----------------------------------------------------------------------------
+# 规范化动作实现
+# -----------------------------------------------------------------------------
+
+def normalize_newlines(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    将文本统一为 LF 换行。
+
+    这是最保守、最稳定的一类规范化动作：
+    - 不改变语义；
+    - 有利于后续脚本行号与正则扫描稳定；
+    - 有利于 Pandoc / Python 跨平台处理。
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    actions: list[ActionRecord] = []
+    if normalized != text:
+        actions.append(
+            ActionRecord(
+                action_type="normalize_newlines",
+                severity=SEVERITY_INFO,
+                file=safe_relative(file_path, root),
+                line=1,
+                message="统一换行风格为 LF。",
+            )
+        )
+    return normalized, actions
+
+
+def add_graphics_extensions(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    为 \\includegraphics 中缺失扩展名的图片路径补全真实扩展名。
+
+    设计理由：
+    - 这是对 Pandoc 主转换帮助较大的确定性改写；
+    - 只有当实际文件存在且扩展名唯一可解析时才改写；
+    - 已带扩展名的路径不动。
+    """
+    actions: list[ActionRecord] = []
+
+    pattern = re.compile(r"\\includegraphics(?P<opts>\[[^\]]*\])?\{(?P<target>[^}]+)\}")
+
+    def repl(match: re.Match) -> str:
+        nonlocal actions
+        target = match.group("target").strip()
+        opts = match.group("opts") or ""
+        if Path(target).suffix:
+            return match.group(0)
+
+        resolved = resolve_path_with_extensions(file_path.parent, target, IMAGE_EXTENSIONS)
+        if resolved is None:
+            return match.group(0)
+
+        relative_resolved = resolved.relative_to(file_path.parent.resolve())
+        # 将 Windows 反斜杠统一为 LaTeX 更稳妥的正斜杠。
+        normalized_target = relative_resolved.as_posix()
+
+        line_no = line_number_from_offset(text, match.start())
+        actions.append(
+            ActionRecord(
+                action_type="add_graphics_extension",
+                severity=SEVERITY_INFO,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="为图片路径补全实际扩展名。",
+                details={"old_target": target, "new_target": normalized_target},
+            )
+        )
+        return f"\\includegraphics{opts}{{{normalized_target}}}"
+
+    new_text = pattern.sub(repl, text)
+    return new_text, actions
+
+
+def add_bibliography_extensions(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    为 bibliography 资源补全 .bib 扩展名。
+
+    支持：
+    - \\addbibresource{refs}
+    - \\bibliography{refs,more_refs}
+
+    说明：
+    - 只在能唯一解析到实际 .bib 文件时才补全；
+    - 已带扩展名则不动；
+    - 这一步是路径规范化，不改变 bibliography 语义。
+    """
+    actions: list[ActionRecord] = []
+
+    addbib_pattern = re.compile(r"\\addbibresource(?P<opts>\[[^\]]*\])?\{(?P<target>[^}]+)\}")
+    bibliography_pattern = re.compile(r"\\bibliography\{(?P<targets>[^}]+)\}")
+
+    def addbib_repl(match: re.Match) -> str:
+        nonlocal actions
+        target = match.group("target").strip()
+        opts = match.group("opts") or ""
+
+        if Path(target).suffix:
+            return match.group(0)
+
+        resolved = resolve_path_with_extensions(file_path.parent, target, BIB_EXTENSIONS)
+        if resolved is None:
+            return match.group(0)
+
+        relative_resolved = resolved.relative_to(file_path.parent.resolve())
+        normalized_target = relative_resolved.as_posix()
+        line_no = line_number_from_offset(text, match.start())
+        actions.append(
+            ActionRecord(
+                action_type="add_bib_extension",
+                severity=SEVERITY_INFO,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="为 addbibresource 路径补全 .bib 扩展名。",
+                details={"old_target": target, "new_target": normalized_target},
+            )
+        )
+        return f"\\addbibresource{opts}{{{normalized_target}}}"
+
+    def bibliography_repl(match: re.Match) -> str:
+        nonlocal actions
+        targets = split_csv_payload(match.group("targets"))
+        if not targets:
+            return match.group(0)
+
+        changed = False
+        new_targets: list[str] = []
+        line_no = line_number_from_offset(text, match.start())
+
+        for target in targets:
+            if Path(target).suffix:
+                new_targets.append(target)
+                continue
+            resolved = resolve_path_with_extensions(file_path.parent, target, BIB_EXTENSIONS)
+            if resolved is None:
+                new_targets.append(target)
+                continue
+            relative_resolved = resolved.relative_to(file_path.parent.resolve())
+            normalized_target = relative_resolved.as_posix()
+            new_targets.append(normalized_target)
+            changed = True
+            actions.append(
+                ActionRecord(
+                    action_type="add_bib_extension",
+                    severity=SEVERITY_INFO,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="为 bibliography 路径补全 .bib 扩展名。",
+                    details={"old_target": target, "new_target": normalized_target},
+                )
+            )
+
+        if not changed:
+            return match.group(0)
+        return f"\\bibliography{{{','.join(new_targets)}}}"
+
+    text = addbib_pattern.sub(addbib_repl, text)
+    text = bibliography_pattern.sub(bibliography_repl, text)
+    return text, actions
+
+
+def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    对常见扩展交叉引用命令做保守降级。
+
+    当前实现：
+    - \\autoref{label} -> \\ref{label}
+    - \\cref{a,b} / \\Cref{a,b} -> \\ref{a}, \\ref{b}
+
+    为什么这样做：
+    - Pandoc 对 LaTeX 内部扩展交叉引用并不总能稳定保持；
+    - 规范化阶段优先保留“目标信息”和“可恢复编号关系”；
+    - 将类型前缀（Figure / Table / Equation 等）弱化，属于可接受降级。
+    """
+    actions: list[ActionRecord] = []
+
+    autoref_pattern = re.compile(r"\\autoref\{([^}]+)\}")
+    cref_pattern = re.compile(r"\\(cref|Cref)\{([^}]+)\}")
+
+    def autoref_repl(match: re.Match) -> str:
+        label = match.group(1).strip()
+        line_no = line_number_from_offset(text, match.start())
+        actions.append(
+            ActionRecord(
+                action_type="normalize_autoref",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将 \\autoref 保守降级为 \\ref。",
+                details={"label": label},
+            )
+        )
+        return f"\\ref{{{label}}}"
+
+    def cref_repl(match: re.Match) -> str:
+        labels = split_csv_payload(match.group(2))
+        line_no = line_number_from_offset(text, match.start())
+
+        if not labels:
+            return match.group(0)
+
+        actions.append(
+            ActionRecord(
+                action_type="normalize_cref",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将 \\cref / \\Cref 保守降级为多个 \\ref。",
+                details={"labels": labels, "source_command": match.group(1)},
+            )
+        )
+        return ", ".join(f"\\ref{{{label}}}" for label in labels)
+
+    text = autoref_pattern.sub(autoref_repl, text)
+    text = cref_pattern.sub(cref_repl, text)
+    return text, actions
+
+
+def find_first_command_span(text: str, command_name: str) -> Optional[tuple[int, int]]:
+    """
+    在一段文本中查找第一个类似 \\command[optional]{mandatory} 的命令区间。
+
+    返回：
+    - (start, end) 形式的半开区间
+    - 若未找到或 mandatory 参数不完整，则返回 None
+
+    用途：
+    - 在 float 环境内部寻找首个 \\caption
+    - 在 float 环境内部寻找首个 \\label
+    """
+    command_pattern = re.compile(rf"\\{re.escape(command_name)}(?:\[[^\]]*\])?")
+    match = command_pattern.search(text)
+    if not match:
+        return None
+
+    cursor = match.end()
+    cursor = skip_whitespace(text, cursor)
+    if cursor >= len(text) or text[cursor] != "{":
+        return None
+
+    end = parse_balanced_group(text, cursor, "{", "}")
+    if end is None:
+        return None
+
+    return match.start(), end
+
+
+def reorder_label_after_caption_in_floats(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    在 figure / table / figure* / table* 环境中，将“caption 前紧邻 label”调整为“caption 后 label”。
+
+    为什么只做这种保守变换：
+    - 这是最常见、最有助于后续交叉引用恢复的写法规范化；
+    - 若 label 与 caption 之间夹杂大量其他内容，则不强行移动；
+    - 避免因为过度“聪明”而改变 float 内部真正语义。
+    """
+    actions: list[ActionRecord] = []
+
+    float_pattern = re.compile(
+        r"\\begin\{(?P<env>figure\*?|table\*?)\}(?P<body>.*?)\\end\{(?P=env)\}",
+        re.DOTALL,
+    )
+
+    def repl(match: re.Match) -> str:
+        nonlocal actions
+        env_name = match.group("env")
+        body = match.group("body")
+
+        label_span = find_first_command_span(body, "label")
+        caption_span = find_first_command_span(body, "caption")
+
+        if not label_span or not caption_span:
+            return match.group(0)
+
+        label_start, label_end = label_span
+        caption_start, caption_end = caption_span
+
+        # 仅在“label 明显位于 caption 前，且两者之间只有空白”时重排。
+        # 这是保守且安全的情况。
+        if label_start < caption_start:
+            middle = body[label_end:caption_start]
+            if middle.strip() == "":
+                label_text = body[label_start:label_end]
+                caption_text = body[caption_start:caption_end]
+
+                new_body = (
+                    body[:label_start]
+                    + caption_text
+                    + "\n"
+                    + label_text
+                    + body[caption_end:]
+                )
+
+                line_no = line_number_from_offset(text, match.start())
+                actions.append(
+                    ActionRecord(
+                        action_type="reorder_label_after_caption",
+                        severity=SEVERITY_INFO,
+                        file=safe_relative(file_path, root),
+                        line=line_no,
+                        message="在 float 环境中将 \\label 调整到 \\caption 之后。",
+                        details={"environment": env_name},
+                    )
+                )
+                return f"\\begin{{{env_name}}}{new_body}\\end{{{env_name}}}"
+
+        return match.group(0)
+
+    new_text = float_pattern.sub(repl, text)
+    return new_text, actions
+
+
+def split_document_body(text: str) -> tuple[str, str]:
+    """
+    将文本拆成“前导部分”和“正文部分”。
+
+    规则：
+    - 若包含 \\begin{document}，则：
+      * prefix 包含到该命令结束为止
+      * body 为其后的内容
+    - 若不包含，则 prefix 为空，body 为全文
+
+    用途：
+    - 避免在主文件导言区误展开宏使用；
+    - 对普通章节子文件则直接视为正文整体。
+    """
+    marker = r"\begin{document}"
+    idx = text.find(marker)
+    if idx == -1:
+        return "", text
+    split_point = idx + len(marker)
+    return text[:split_point], text[split_point:]
+
+
+def expand_zero_arg_macros(
+    text: str,
+    file_path: Path,
+    root: Path,
+    macros: dict[str, MacroDefinition],
+) -> tuple[str, list[ActionRecord]]:
+    """
+    在正文区域内展开“可安全展开”的零参数宏。
+
+    策略：
+    - 仅在正文区域做替换，尽量避免改动导言区和宏定义区；
+    - 对每个宏做精确命令边界匹配；
+    - 使用最多两轮替换，以支持简单的链式零参数展开；
+    - 绝不删除原始定义，只替换实际使用位置。
+
+    注意：
+    - 这是“保守辅助展开”，不是完整宏求值器；
+    - 若宏用法复杂，本函数不会试图处理。
+    """
+    if not macros:
+        return text, []
+
+    actions: list[ActionRecord] = []
+    prefix, body = split_document_body(text)
+
+    # 为减少短命令与长命令前缀碰撞，按命令名长度逆序处理。
+    ordered_macros = sorted(macros.values(), key=lambda item: len(item.name), reverse=True)
+
+    # 最多两轮，避免出现意外递归膨胀。
+    for _ in range(2):
+        any_replaced = False
+        for macro in ordered_macros:
+            pattern = re.compile(rf"(?<!\\)\\{re.escape(macro.name)}(?![A-Za-z@])")
+
+            def repl(match: re.Match) -> str:
+                nonlocal actions, any_replaced, body
+                any_replaced = True
+                line_no = line_number_from_offset(prefix + body, len(prefix) + match.start())
+                actions.append(
+                    ActionRecord(
+                        action_type="expand_zero_arg_macro",
+                        severity=SEVERITY_INFO,
+                        file=safe_relative(file_path, root),
+                        line=line_no,
+                        message="展开可安全展开的零参数宏。",
+                        details={
+                            "macro_name": macro.name,
+                            "defined_in": macro.defined_in,
+                            "defined_line": macro.line,
+                        },
+                    )
+                )
+                return macro.replacement
+
+            body = pattern.sub(repl, body)
+
+        if not any_replaced:
+            break
+
+    return prefix + body, actions
+
+
+# -----------------------------------------------------------------------------
+# 文件处理与报告渲染
+# -----------------------------------------------------------------------------
+
+def process_tex_file(
+    file_path: Path,
+    work_root: Path,
+    macros: dict[str, MacroDefinition],
+) -> tuple[bool, list[ActionRecord]]:
+    """
+    对单个 TeX 文件执行规范化动作。
+
+    返回：
+    - modified: 文件内容是否发生变化
+    - actions: 动作列表
+
+    执行顺序固定如下：
+    1. 统一换行
+    2. 补全图片扩展名
+    3. 补全 bib 扩展名
+    4. 规范化扩展交叉引用
+    5. 调整 float 中 caption / label 顺序
+    6. 展开安全零参数宏
+
+    顺序理由：
+    - 先做低风险路径规范化；
+    - 再做交叉引用规范化；
+    - 最后做宏展开，避免展开后的路径/引用再次复杂化。
+    """
+    actions: list[ActionRecord] = []
+
+    original_text = read_text_file(file_path)
+    text = original_text
+
+    text, file_actions = normalize_newlines(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = add_graphics_extensions(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = add_bibliography_extensions(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = normalize_extended_refs(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = reorder_label_after_caption_in_floats(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = expand_zero_arg_macros(text, file_path, work_root, macros)
+    actions.extend(file_actions)
+
+    modified = text != original_text
+    if modified:
+        write_text_file(file_path, text)
+
+    return modified, actions
+
+
+def render_markdown_report(report: NormalizationReport) -> str:
+    """
+    将规范化报告渲染为 Markdown。
+
+    报告目标：
+    - 让用户知道“工作副本在哪里”；
+    - 让后续脚本知道“改了什么类型的东西”；
+    - 让人工审查者知道“哪些改写带有降级含义”。
+    """
+    lines: list[str] = []
+    lines.append("# Normalization Report")
+    lines.append("")
+    lines.append(f"- Status: **{report.status}**")
+    lines.append(f"- Can continue: **{report.can_continue}**")
+    lines.append(f"- Used precheck report: **{report.used_precheck_report}**")
+    lines.append(f"- Project root: `{report.project_root}`")
+    lines.append(f"- Work root: `{report.work_root}`")
+    lines.append(f"- Source main TeX: `{report.source_main_tex or 'N/A'}`")
+    lines.append(f"- Normalized main TeX: `{report.normalized_main_tex or 'N/A'}`")
+    lines.append("")
+
+    lines.append("## Summary")
+    lines.append("")
+    for key, value in report.summary.items():
+        lines.append(f"- {key}: **{value}**")
+    lines.append("")
+
+    lines.append("## Metrics")
+    lines.append("")
+    for key, value in report.metrics.items():
+        lines.append(f"- {key}: **{value}**")
+    lines.append("")
+
+    lines.append("## Processed TeX Files")
+    lines.append("")
+    if report.tex_files_processed:
+        for item in report.tex_files_processed:
+            lines.append(f"- `{item}`")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.append("## File Summaries")
+    lines.append("")
+    if report.file_summaries:
+        for item in report.file_summaries:
+            lines.append(f"- `{item['file']}`")
+            lines.append(f"  - modified: **{item['modified']}**")
+            lines.append(f"  - action_count: **{item['action_count']}**")
+            if item["actions_by_type"]:
+                for key, value in item["actions_by_type"].items():
+                    lines.append(f"  - {key}: **{value}**")
+            else:
+                lines.append("  - actions_by_type: (none)")
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.append("## Actions")
+    lines.append("")
+    if report.actions:
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for item in report.actions:
+            grouped[item["severity"]].append(item)
+
+        for severity in [SEVERITY_ERROR, SEVERITY_WARN, SEVERITY_INFO]:
+            if severity not in grouped:
+                continue
+            lines.append(f"### {severity}")
+            lines.append("")
+            for item in grouped[severity]:
+                location = f"`{item['file']}`"
+                if item.get("line"):
+                    location += f":{item['line']}"
+                lines.append(f"- **[{item['action_type']}]** {item['message']} ({location})")
+            lines.append("")
+    else:
+        lines.append("- No actions recorded.")
+        lines.append("")
+
+    lines.append("## Recommendations")
+    lines.append("")
+    if report.recommendations:
+        for recommendation in report.recommendations:
+            lines.append(f"- {recommendation}")
+    else:
+        lines.append("- No immediate action required.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# 主入口
+# -----------------------------------------------------------------------------
+
+def main() -> int:
+    """
+    主入口函数。
+
+    固定执行顺序：
+    1. 解析参数；
+    2. 解析工程根目录、skill 根目录、precheck 报告；
+    3. 解析主文件；
+    4. 校验工作目录安全性；
+    5. 复制工程到工作目录；
+    6. 收集目标 TeX 文件；
+    7. 收集可安全展开的零参数宏；
+    8. 逐文件规范化；
+    9. 生成 JSON / Markdown 报告；
+    10. 输出控制台摘要；
+    11. 返回退出码。
+    """
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    project_root = Path(args.project_root).resolve()
+    if not project_root.exists() or not project_root.is_dir():
+        print(f"[ERROR] 无效的工程目录: {project_root}", file=sys.stderr)
+        return 1
+
+    skill_root = locate_skill_root()
+
+    precheck_json_path = (
+        Path(args.precheck_json).resolve()
+        if args.precheck_json
+        else (project_root / "precheck-report.json").resolve()
+    )
+    precheck_report = load_json_if_exists(precheck_json_path)
+    used_precheck_report = precheck_report is not None
+
+    action_log: list[ActionRecord] = []
+    action_log.extend(check_rule_files(skill_root))
+
+    # 若 precheck 已明确 FAIL，则本阶段不应继续假装正常。
+    if precheck_report and precheck_report.get("status") == STATUS_FAIL:
+        action_log.append(
+            ActionRecord(
+                action_type="abort_due_to_precheck_fail",
+                severity=SEVERITY_ERROR,
+                file=safe_relative(precheck_json_path, project_root),
+                line=None,
+                message="precheck-report.json 显示预检查失败，规范化阶段已中止。",
+                details={"precheck_status": precheck_report.get("status")},
+            )
+        )
+        work_root = (
+            Path(args.work_root).resolve()
+            if args.work_root
+            else default_work_root_for(project_root)
+        )
+        report = NormalizationReport(
+            status=STATUS_FAIL,
+            can_continue=False,
+            used_precheck_report=used_precheck_report,
+            project_root=str(project_root),
+            work_root=str(work_root),
+            source_main_tex=None,
+            normalized_main_tex=None,
+            tex_files_processed=[],
+            tex_files_processed_count=0,
+            tex_files_modified_count=0,
+            actions=[asdict(a) for a in action_log],
+            file_summaries=[],
+            metrics={
+                "action_count": len(action_log),
+                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+            },
+            summary={
+                "status": STATUS_FAIL,
+                "reason": "precheck_failed",
+            },
+            recommendations=[
+                "先修复 precheck-report.json 中的 ERROR 级问题，再重新运行 normalize_tex.py。"
+            ],
+        )
+
+        json_out = work_root / "normalization-report.json"
+        md_out = work_root / "normalization-report.md"
+        write_json(json_out, asdict(report))
+        write_text_file(md_out, render_markdown_report(report))
+
+        print(f"[{report.status}] normalization aborted because precheck failed.")
+        print(f"JSON report: {json_out}")
+        print(f"Markdown report: {md_out}")
+        return 1
+
+    # 解析主文件
+    main_tex, main_actions = resolve_main_tex(project_root, args.main_tex, precheck_report)
+    action_log.extend(main_actions)
+    if main_tex is None:
+        work_root = (
+            Path(args.work_root).resolve()
+            if args.work_root
+            else default_work_root_for(project_root)
+        )
+        report = NormalizationReport(
+            status=STATUS_FAIL,
+            can_continue=False,
+            used_precheck_report=used_precheck_report,
+            project_root=str(project_root),
+            work_root=str(work_root),
+            source_main_tex=None,
+            normalized_main_tex=None,
+            tex_files_processed=[],
+            tex_files_processed_count=0,
+            tex_files_modified_count=0,
+            actions=[asdict(a) for a in action_log],
+            file_summaries=[],
+            metrics={
+                "action_count": len(action_log),
+                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+            },
+            summary={"status": STATUS_FAIL, "reason": "main_tex_not_resolved"},
+            recommendations=[
+                "显式传入 --main-tex，或先运行 precheck.py 生成 precheck-report.json。"
+            ],
+        )
+
+        json_out = work_root / "normalization-report.json"
+        md_out = work_root / "normalization-report.md"
+        write_json(json_out, asdict(report))
+        write_text_file(md_out, render_markdown_report(report))
+
+        print(f"[{report.status}] normalization failed: main TeX file could not be resolved.")
+        print(f"JSON report: {json_out}")
+        print(f"Markdown report: {md_out}")
+        return 1
+
+    # 解析工作目录
+    work_root = Path(args.work_root).resolve() if args.work_root else default_work_root_for(project_root)
+    safety_error = ensure_work_root_is_safe(project_root, work_root)
+    if safety_error:
+        action_log.append(
+            ActionRecord(
+                action_type="unsafe_work_root",
+                severity=SEVERITY_ERROR,
+                file=safe_relative(work_root, project_root),
+                line=None,
+                message=safety_error,
+            )
+        )
+        report = NormalizationReport(
+            status=STATUS_FAIL,
+            can_continue=False,
+            used_precheck_report=used_precheck_report,
+            project_root=str(project_root),
+            work_root=str(work_root),
+            source_main_tex=safe_relative(main_tex, project_root),
+            normalized_main_tex=None,
+            tex_files_processed=[],
+            tex_files_processed_count=0,
+            tex_files_modified_count=0,
+            actions=[asdict(a) for a in action_log],
+            file_summaries=[],
+            metrics={
+                "action_count": len(action_log),
+                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+            },
+            summary={"status": STATUS_FAIL, "reason": "unsafe_work_root"},
+            recommendations=[
+                "将工作目录设置到原始工程目录之外，例如工程同级目录。"
+            ],
+        )
+
+        json_out = work_root / "normalization-report.json"
+        md_out = work_root / "normalization-report.md"
+        write_json(json_out, asdict(report))
+        write_text_file(md_out, render_markdown_report(report))
+
+        print(f"[{report.status}] normalization failed: unsafe work root.")
+        print(f"JSON report: {json_out}")
+        print(f"Markdown report: {md_out}")
+        return 1
+
+    # 处理已存在工作目录
+    if work_root.exists():
+        if args.force:
+            shutil.rmtree(work_root)
+            action_log.append(
+                ActionRecord(
+                    action_type="remove_existing_work_root",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(work_root, work_root.parent),
+                    line=None,
+                    message="检测到已存在的工作目录，已按 --force 删除后重建。",
+                )
+            )
+        else:
+            action_log.append(
+                ActionRecord(
+                    action_type="work_root_already_exists",
+                    severity=SEVERITY_ERROR,
+                    file=safe_relative(work_root, work_root.parent),
+                    line=None,
+                    message="工作目录已存在；若确认可覆盖，请使用 --force。",
+                )
+            )
+            report = NormalizationReport(
+                status=STATUS_FAIL,
+                can_continue=False,
+                used_precheck_report=used_precheck_report,
+                project_root=str(project_root),
+                work_root=str(work_root),
+                source_main_tex=safe_relative(main_tex, project_root),
+                normalized_main_tex=None,
+                tex_files_processed=[],
+                tex_files_processed_count=0,
+                tex_files_modified_count=0,
+                actions=[asdict(a) for a in action_log],
+                file_summaries=[],
+                metrics={
+                    "action_count": len(action_log),
+                    "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+                    "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+                    "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+                },
+                summary={"status": STATUS_FAIL, "reason": "work_root_exists"},
+                recommendations=[
+                    "使用 --force 允许删除旧工作目录，或改用新的 --work-root。"
+                ],
+            )
+
+            json_out = work_root / "normalization-report.json"
+            md_out = work_root / "normalization-report.md"
+            write_json(json_out, asdict(report))
+            write_text_file(md_out, render_markdown_report(report))
+
+            print(f"[{report.status}] normalization failed: work root already exists.")
+            print(f"JSON report: {json_out}")
+            print(f"Markdown report: {md_out}")
+            return 1
+
+    # 复制工程
+    copy_project_tree(project_root, work_root)
+    action_log.append(
+        ActionRecord(
+            action_type="copy_project_tree",
+            severity=SEVERITY_INFO,
+            file=safe_relative(work_root, work_root.parent),
+            line=None,
+            message="已将原始工程复制到规范化工作目录。",
+        )
+    )
+
+    # 解析规范化后主文件路径
+    normalized_main_tex = (work_root / safe_relative(main_tex, project_root)).resolve()
+    if not normalized_main_tex.exists():
+        action_log.append(
+            ActionRecord(
+                action_type="normalized_main_tex_missing_after_copy",
+                severity=SEVERITY_ERROR,
+                file=safe_relative(normalized_main_tex, work_root),
+                line=None,
+                message="复制完成后未在工作目录中找到主 TeX 文件。",
+            )
+        )
+
+        report = NormalizationReport(
+            status=STATUS_FAIL,
+            can_continue=False,
+            used_precheck_report=used_precheck_report,
+            project_root=str(project_root),
+            work_root=str(work_root),
+            source_main_tex=safe_relative(main_tex, project_root),
+            normalized_main_tex=safe_relative(normalized_main_tex, work_root),
+            tex_files_processed=[],
+            tex_files_processed_count=0,
+            tex_files_modified_count=0,
+            actions=[asdict(a) for a in action_log],
+            file_summaries=[],
+            metrics={
+                "action_count": len(action_log),
+                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+            },
+            summary={"status": STATUS_FAIL, "reason": "normalized_main_tex_missing"},
+            recommendations=[
+                "检查复制后的工作目录结构，确认主文件相对路径是否正确。"
+            ],
+        )
+
+        json_out = work_root / "normalization-report.json"
+        md_out = work_root / "normalization-report.md"
+        write_json(json_out, asdict(report))
+        write_text_file(md_out, render_markdown_report(report))
+
+        print(f"[{report.status}] normalization failed: normalized main TeX missing.")
+        print(f"JSON report: {json_out}")
+        print(f"Markdown report: {md_out}")
+        return 1
+
+    # 收集目标 TeX 文件
+    target_tex_files = collect_target_tex_files(project_root, work_root, precheck_report)
+    if not target_tex_files:
+        action_log.append(
+            ActionRecord(
+                action_type="no_target_tex_files",
+                severity=SEVERITY_ERROR,
+                file=safe_relative(work_root, work_root),
+                line=None,
+                message="工作目录中没有可供规范化的 TeX 文件。",
+            )
+        )
+
+        report = NormalizationReport(
+            status=STATUS_FAIL,
+            can_continue=False,
+            used_precheck_report=used_precheck_report,
+            project_root=str(project_root),
+            work_root=str(work_root),
+            source_main_tex=safe_relative(main_tex, project_root),
+            normalized_main_tex=safe_relative(normalized_main_tex, work_root),
+            tex_files_processed=[],
+            tex_files_processed_count=0,
+            tex_files_modified_count=0,
+            actions=[asdict(a) for a in action_log],
+            file_summaries=[],
+            metrics={
+                "action_count": len(action_log),
+                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+            },
+            summary={"status": STATUS_FAIL, "reason": "no_target_tex_files"},
+            recommendations=[
+                "检查 precheck-report.json 中的 scanned_tex_files，或确认工程中确实存在 .tex 文件。"
+            ],
+        )
+
+        json_out = work_root / "normalization-report.json"
+        md_out = work_root / "normalization-report.md"
+        write_json(json_out, asdict(report))
+        write_text_file(md_out, render_markdown_report(report))
+
+        print(f"[{report.status}] normalization failed: no target TeX files found.")
+        print(f"JSON report: {json_out}")
+        print(f"Markdown report: {md_out}")
+        return 1
+
+    # 收集零参数安全宏
+    macros, macro_actions = collect_zero_arg_macros(target_tex_files, work_root)
+    action_log.extend(macro_actions)
+
+    # 逐文件规范化
+    file_summaries: list[FileSummary] = []
+    modified_count = 0
+
+    for tex_file in target_tex_files:
+        try:
+            modified, file_actions = process_tex_file(tex_file, work_root, macros)
+            action_log.extend(file_actions)
+
+            actions_by_type = Counter(action.action_type for action in file_actions)
+            file_summaries.append(
+                FileSummary(
+                    file=safe_relative(tex_file, work_root),
+                    modified=modified,
+                    action_count=len(file_actions),
+                    actions_by_type=dict(sorted(actions_by_type.items())),
+                )
+            )
+            if modified:
+                modified_count += 1
+
+        except Exception as exc:
+            action_log.append(
+                ActionRecord(
+                    action_type="process_tex_file_failed",
+                    severity=SEVERITY_ERROR,
+                    file=safe_relative(tex_file, work_root),
+                    line=None,
+                    message="规范化该 TeX 文件时发生异常。",
+                    details={"error": str(exc)},
+                )
+            )
+            file_summaries.append(
+                FileSummary(
+                    file=safe_relative(tex_file, work_root),
+                    modified=False,
+                    action_count=0,
+                    actions_by_type={},
+                )
+            )
+
+    # 最终状态判定
+    error_count = sum(1 for action in action_log if action.severity == SEVERITY_ERROR)
+    warn_count = sum(1 for action in action_log if action.severity == SEVERITY_WARN)
+    info_count = sum(1 for action in action_log if action.severity == SEVERITY_INFO)
+
+    if error_count > 0:
+        status = STATUS_FAIL
+        can_continue = False
+    elif warn_count > 0:
+        status = STATUS_PASS_WITH_WARNINGS
+        can_continue = True
+    else:
+        status = STATUS_PASS
+        can_continue = True
+
+    action_counts = Counter(action.action_type for action in action_log)
+
+    recommendations: list[str] = []
+    if status == STATUS_FAIL:
+        recommendations.append("先修复规范化阶段的 ERROR 级问题，再进入 Pandoc 主转换。")
+    else:
+        recommendations.append("可将规范化后的工作副本作为 Pandoc 主转换输入。")
+
+    if any(action.action_type in {"normalize_autoref", "normalize_cref"} for action in action_log):
+        recommendations.append("交叉引用已做保守降级；后续应在 Word 中重点核对图表公式引用。")
+
+    if any(action.action_type == "reorder_label_after_caption" for action in action_log):
+        recommendations.append("float 中的 caption/label 顺序已部分规范化，有利于后续引用恢复。")
+
+    if any(action.action_type == "expand_zero_arg_macro" for action in action_log):
+        recommendations.append("部分零参数宏已展开；若正文存在复杂自定义命令，仍需在后续阶段重点复核。")
+
+    if any(action.action_type.startswith("skip_") for action in action_log):
+        recommendations.append("存在被跳过的复杂宏定义；这些对象不应被视为已自动处理。")
+
+    report = NormalizationReport(
+        status=status,
+        can_continue=can_continue,
+        used_precheck_report=used_precheck_report,
+        project_root=str(project_root),
+        work_root=str(work_root),
+        source_main_tex=safe_relative(main_tex, project_root),
+        normalized_main_tex=safe_relative(normalized_main_tex, work_root),
+        tex_files_processed=[safe_relative(path, work_root) for path in target_tex_files],
+        tex_files_processed_count=len(target_tex_files),
+        tex_files_modified_count=modified_count,
+        actions=[asdict(action) for action in action_log],
+        file_summaries=[asdict(summary) for summary in file_summaries],
+        metrics={
+            "action_count": len(action_log),
+            "distinct_action_type_count": len(action_counts),
+            "error_count": error_count,
+            "warn_count": warn_count,
+            "info_count": info_count,
+            "safe_zero_arg_macro_count": len(macros),
+            "tex_files_processed_count": len(target_tex_files),
+            "tex_files_modified_count": modified_count,
+        },
+        summary={
+            "status": status,
+            "can_continue": can_continue,
+            "used_precheck_report": used_precheck_report,
+            "source_main_tex": safe_relative(main_tex, project_root),
+            "normalized_main_tex": safe_relative(normalized_main_tex, work_root),
+        },
+        recommendations=recommendations,
+    )
+
+    json_out = work_root / "normalization-report.json"
+    md_out = work_root / "normalization-report.md"
+    write_json(json_out, asdict(report))
+    write_text_file(md_out, render_markdown_report(report))
+
+    print(f"[{report.status}] normalization completed.")
+    print(f"Source main TeX: {report.source_main_tex}")
+    print(f"Normalized main TeX: {report.normalized_main_tex}")
+    print(f"Processed TeX files: {report.tex_files_processed_count}")
+    print(f"Modified TeX files: {report.tex_files_modified_count}")
+    print(f"Errors: {report.metrics['error_count']}")
+    print(f"Warnings: {report.metrics['warn_count']}")
+    print(f"Infos: {report.metrics['info_count']}")
+    print(f"Work root: {work_root}")
+    print(f"JSON report: {json_out}")
+    print(f"Markdown report: {md_out}")
+
+    return 1 if report.status == STATUS_FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
