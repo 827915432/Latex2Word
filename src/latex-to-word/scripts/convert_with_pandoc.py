@@ -84,6 +84,8 @@ STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
 STATUS_FAIL = "FAIL"
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".bmp", ".tif", ".tiff"]
+RESOURCE_DIR_LIMIT_DEFAULT = 200
+COMMAND_LENGTH_LIMIT_DEFAULT = 7800
 
 
 @dataclass
@@ -106,6 +108,13 @@ class ConversionContext:
     thebibliography_used: bool
     cite_count: int
     resource_dirs: list[Path]
+    resource_dirs_priority: list[Path]
+    resource_dirs_original_count: int
+    resource_dir_limit: int
+    resource_dir_strategy: str
+    command_length_limit: int
+    command_length_estimate: int
+    guard_warnings: list[str]
     normalization_report: dict
     normalized_source_root: Path
 
@@ -137,6 +146,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--report-md",
         default=None,
         help="转换报告 Markdown 路径。默认 <work-root>/stage_convert/pandoc-conversion-report.md",
+    )
+    parser.add_argument(
+        "--max-resource-dirs",
+        type=int,
+        default=RESOURCE_DIR_LIMIT_DEFAULT,
+        help=f"resource-path 目录数量保护阈值（默认 {RESOURCE_DIR_LIMIT_DEFAULT}）。",
+    )
+    parser.add_argument(
+        "--max-command-length",
+        type=int,
+        default=COMMAND_LENGTH_LIMIT_DEFAULT,
+        help=f"Pandoc 命令长度保护阈值（默认 {COMMAND_LENGTH_LIMIT_DEFAULT}）。",
     )
     return parser
 
@@ -186,6 +207,79 @@ def collect_bibliographies_and_cites(tex_files: list[Path]) -> tuple[list[Path],
                     bibliographies.add(resolved)
 
     return sorted(bibliographies), thebibliography_used, cite_count
+
+
+def unique_paths_in_order(paths: list[Path]) -> list[Path]:
+    """
+    路径去重并保持原有顺序（统一为 resolve 后路径）。
+    """
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        resolved = path.resolve()
+        key = str(resolved).lower() if os.name == "nt" else str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return result
+
+
+def build_priority_resource_dirs(
+    *,
+    main_tex: Path,
+    normalized_source_root: Path,
+    tex_files: list[Path],
+    bibliographies: list[Path],
+) -> list[Path]:
+    """
+    构建 resource-path 优先目录集合。
+
+    优先级（从高到低）：
+    1. normalized_source_root；
+    2. main.tex 所在目录；
+    3. 所有 TeX 文件所在目录；
+    4. bibliography 文件所在目录。
+    """
+    candidates: list[Path] = [normalized_source_root.resolve(), main_tex.parent.resolve()]
+    candidates.extend(path.parent.resolve() for path in tex_files)
+    candidates.extend(path.parent.resolve() for path in bibliographies)
+    return unique_paths_in_order(candidates)
+
+
+def apply_resource_dir_count_guard(
+    *,
+    all_resource_dirs: list[Path],
+    priority_dirs: list[Path],
+    max_resource_dirs: int,
+) -> tuple[list[Path], str, list[str]]:
+    """
+    对 resource-path 目录数量做阈值保护，超限时按优先级裁剪。
+    """
+    warnings: list[str] = []
+    limit = max(1, int(max_resource_dirs))
+    all_unique = unique_paths_in_order(all_resource_dirs)
+
+    if len(all_unique) <= limit:
+        return all_unique, "full", warnings
+
+    selected = unique_paths_in_order(priority_dirs)
+    selected_keys = {str(path).lower() if os.name == "nt" else str(path) for path in selected}
+    for path in all_unique:
+        if len(selected) >= limit:
+            break
+        key = str(path).lower() if os.name == "nt" else str(path)
+        if key in selected_keys:
+            continue
+        selected.append(path)
+        selected_keys.add(key)
+
+    selected = selected[:limit]
+    warnings.append(
+        "resource-path 目录数超限，已按优先级裁剪："
+        f" original={len(all_unique)}, limit={limit}, selected={len(selected)}。"
+    )
+    return selected, "capped_by_priority", warnings
 
 
 def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
@@ -306,9 +400,20 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         tex_files = sorted(work_root.rglob("*.tex"))
 
     bibliographies, thebibliography_used, cite_count = collect_bibliographies_and_cites(tex_files)
-    resource_dirs = sorted(
+    resource_dirs_all = sorted(
         {path.resolve() for path in normalized_source_root.rglob("*") if path.is_dir()}
         | {normalized_source_root.resolve()}
+    )
+    resource_dirs_priority = build_priority_resource_dirs(
+        main_tex=main_tex,
+        normalized_source_root=normalized_source_root,
+        tex_files=tex_files,
+        bibliographies=bibliographies,
+    )
+    resource_dirs, resource_dir_strategy, guard_warnings = apply_resource_dir_count_guard(
+        all_resource_dirs=resource_dirs_all,
+        priority_dirs=resource_dirs_priority,
+        max_resource_dirs=args.max_resource_dirs,
     )
 
     if cite_count > 0 and not bibliographies and not thebibliography_used:
@@ -317,23 +422,6 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
     metadata_json = (convert_stage_dir / ".pandoc_metadata.json").resolve()
     resource_dirs_txt = (convert_stage_dir / ".pandoc_resource_dirs.txt").resolve()
     bibs_txt = (convert_stage_dir / ".pandoc_bibliographies.txt").resolve()
-
-    metadata_payload = {
-        "normalization_status": normalization_status,
-        "normalization_can_continue": normalization_can_continue,
-        "main_tex": str(main_tex),
-        "tex_file_count": len(tex_files),
-        "bibliography_file_count": len(bibliographies),
-        "bibliographies": [str(path) for path in bibliographies],
-        "thebibliography_used": thebibliography_used,
-        "cite_count": cite_count,
-        "resource_dir_count": len(resource_dirs),
-        "resource_dirs": [str(path) for path in resource_dirs],
-        "normalized_source_root": str(normalized_source_root),
-    }
-    metadata_json.write_text(json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    resource_dirs_txt.write_text("\n".join(str(path) for path in resource_dirs), encoding="utf-8")
-    bibs_txt.write_text("\n".join(str(path) for path in bibliographies), encoding="utf-8")
 
     return ConversionContext(
         work_root=work_root,
@@ -354,6 +442,13 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         thebibliography_used=thebibliography_used,
         cite_count=cite_count,
         resource_dirs=resource_dirs,
+        resource_dirs_priority=resource_dirs_priority,
+        resource_dirs_original_count=len(resource_dirs_all),
+        resource_dir_limit=max(1, int(args.max_resource_dirs)),
+        resource_dir_strategy=resource_dir_strategy,
+        command_length_limit=max(256, int(args.max_command_length)),
+        command_length_estimate=0,
+        guard_warnings=list(guard_warnings),
         normalization_report=normalization_report,
         normalized_source_root=normalized_source_root,
     )
@@ -365,10 +460,15 @@ def format_command_for_log(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
-def build_pandoc_command(context: ConversionContext) -> list[str]:
-    resource_path_value = os.pathsep.join(str(path) for path in context.resource_dirs) if context.resource_dirs else str(
-        context.work_root
-    )
+def estimate_command_length(command: list[str]) -> int:
+    """
+    估算命令行长度（用于阈值保护）。
+    """
+    return len(format_command_for_log(command))
+
+
+def build_pandoc_command(context: ConversionContext, resource_dirs: list[Path]) -> list[str]:
+    resource_path_value = os.pathsep.join(str(path) for path in resource_dirs) if resource_dirs else str(context.work_root)
 
     command: list[str] = [
         "pandoc",
@@ -391,6 +491,105 @@ def build_pandoc_command(context: ConversionContext) -> list[str]:
     return command
 
 
+def build_compact_resource_dirs(context: ConversionContext) -> list[Path]:
+    """
+    构建紧凑型 resource-path 目录集合，用于命令长度超限时降级。
+    """
+    compact_candidates: list[Path] = [
+        context.normalized_source_root,
+        context.main_tex.parent,
+    ]
+    compact_candidates.extend(path.parent for path in context.bibliographies)
+    return unique_paths_in_order(compact_candidates)
+
+
+def select_safe_pandoc_command(context: ConversionContext) -> list[str]:
+    """
+    选择满足阈值保护的 Pandoc 命令：
+    1. 优先使用当前 resource_dirs；
+    2. 若命令长度超限，按候选策略降级 resource-path。
+    """
+    max_len = max(256, int(context.command_length_limit))
+
+    candidates: list[tuple[str, list[Path]]] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+
+    def add_candidate(label: str, dirs: list[Path]) -> None:
+        normalized = unique_paths_in_order(dirs)
+        if not normalized:
+            normalized = [context.normalized_source_root]
+        signature = tuple(
+            (str(path).lower() if os.name == "nt" else str(path))
+            for path in normalized
+        )
+        if signature in seen_signatures:
+            return
+        seen_signatures.add(signature)
+        candidates.append((label, normalized))
+
+    add_candidate("selected", context.resource_dirs)
+    add_candidate("priority", context.resource_dirs_priority)
+    add_candidate("compact", build_compact_resource_dirs(context))
+    add_candidate("root_only", [context.normalized_source_root])
+
+    for index, (label, dirs) in enumerate(candidates):
+        command = build_pandoc_command(context, dirs)
+        cmd_len = estimate_command_length(command)
+        if cmd_len <= max_len:
+            context.resource_dirs = dirs
+            context.command_length_estimate = cmd_len
+            if index > 0:
+                context.resource_dir_strategy = f"{context.resource_dir_strategy}+cmdlen:{label}"
+                context.guard_warnings.append(
+                    "Pandoc 命令长度超限触发降级："
+                    f" selected_strategy={label}, command_length={cmd_len}, limit={max_len}, "
+                    f"resource_dirs={len(dirs)}。"
+                )
+            return command
+
+    # 理论上 root_only 一般已足够收敛；若仍超限则保留最后候选并给出告警。
+    fallback_label, fallback_dirs = candidates[-1]
+    fallback_command = build_pandoc_command(context, fallback_dirs)
+    fallback_len = estimate_command_length(fallback_command)
+    context.resource_dirs = fallback_dirs
+    context.command_length_estimate = fallback_len
+    context.resource_dir_strategy = f"{context.resource_dir_strategy}+cmdlen:{fallback_label}_overflow"
+    context.guard_warnings.append(
+        "Pandoc 命令长度仍高于阈值："
+        f" command_length={fallback_len}, limit={max_len}；已使用最小化 resource-path 继续执行。"
+    )
+    return fallback_command
+
+
+def write_context_debug_artifacts(context: ConversionContext, command: list[str]) -> None:
+    """
+    写出调试辅助文件（metadata/resource_dirs/bibliographies）。
+    """
+    metadata_payload = {
+        "normalization_status": context.normalization_status,
+        "normalization_can_continue": context.normalization_can_continue,
+        "main_tex": str(context.main_tex),
+        "tex_file_count": context.tex_file_count,
+        "bibliography_file_count": len(context.bibliographies),
+        "bibliographies": [str(path) for path in context.bibliographies],
+        "thebibliography_used": context.thebibliography_used,
+        "cite_count": context.cite_count,
+        "resource_dir_count": len(context.resource_dirs),
+        "resource_dirs_original_count": context.resource_dirs_original_count,
+        "resource_dir_limit": context.resource_dir_limit,
+        "resource_dir_strategy": context.resource_dir_strategy,
+        "resource_dirs": [str(path) for path in context.resource_dirs],
+        "command_length_limit": context.command_length_limit,
+        "command_length_estimate": context.command_length_estimate,
+        "guard_warnings": context.guard_warnings,
+        "normalized_source_root": str(context.normalized_source_root),
+        "command_preview": format_command_for_log(command),
+    }
+    context.metadata_json.write_text(json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    context.resource_dirs_txt.write_text("\n".join(str(path) for path in context.resource_dirs), encoding="utf-8")
+    context.bibs_txt.write_text("\n".join(str(path) for path in context.bibliographies), encoding="utf-8")
+
+
 def write_log_header(context: ConversionContext, command: list[str]) -> None:
     context.log_file.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -403,6 +602,12 @@ def write_log_header(context: ConversionContext, command: list[str]) -> None:
         f"Normalization JSON: {context.normalization_json}",
         f"Bibliography file count: {len(context.bibliographies)}",
         f"Resource dir count: {len(context.resource_dirs)}",
+        f"Resource dir original count: {context.resource_dirs_original_count}",
+        f"Resource dir strategy: {context.resource_dir_strategy}",
+        f"Resource dir limit: {context.resource_dir_limit}",
+        f"Command length estimate: {context.command_length_estimate}",
+        f"Command length limit: {context.command_length_limit}",
+        f"Guard warning count: {len(context.guard_warnings)}",
         "",
         "Command:",
         f"  {format_command_for_log(command)}",
@@ -435,7 +640,7 @@ def determine_status(context: ConversionContext, pandoc_exit_code: int) -> tuple
     status = STATUS_PASS
     can_continue = True
     failure_reason = ""
-    warnings: list[str] = []
+    warnings: list[str] = list(context.guard_warnings)
 
     if pandoc_exit_code != 0:
         status = STATUS_FAIL
@@ -465,10 +670,8 @@ def determine_status(context: ConversionContext, pandoc_exit_code: int) -> tuple
         if status == STATUS_PASS:
             status = STATUS_PASS_WITH_WARNINGS
 
-    if status != STATUS_FAIL and len(context.resource_dirs) > 200:
-        warnings.append("resource-path 包含的目录较多；若后续性能较差，可考虑收敛资源目录结构。")
-        if status == STATUS_PASS:
-            status = STATUS_PASS_WITH_WARNINGS
+    if status != STATUS_FAIL and warnings and status == STATUS_PASS:
+        status = STATUS_PASS_WITH_WARNINGS
 
     return status, can_continue, failure_reason, warnings
 
@@ -495,12 +698,15 @@ def write_conversion_reports(
         "metrics": {
             "bibliography_file_count": len(context.bibliographies),
             "resource_dir_count": len(context.resource_dirs),
+            "resource_dirs_original_count": context.resource_dirs_original_count,
+            "resource_dir_limit": context.resource_dir_limit,
             "tex_file_count": context.tex_file_count,
             "cite_count": context.cite_count,
         },
         "inventory": {
             "bibliographies": [str(path) for path in context.bibliographies],
             "resource_dirs": [str(path) for path in context.resource_dirs],
+            "resource_dir_strategy": context.resource_dir_strategy,
             "thebibliography_used": context.thebibliography_used,
         },
         "summary": {
@@ -509,6 +715,8 @@ def write_conversion_reports(
             "pandoc_exit_code": pandoc_exit_code,
             "output_exists": context.output_docx.exists(),
             "output_size_bytes": context.output_docx.stat().st_size if context.output_docx.exists() else 0,
+            "command_length_estimate": context.command_length_estimate,
+            "command_length_limit": context.command_length_limit,
         },
         "warnings": warnings,
         "recommendations": [],
@@ -582,7 +790,8 @@ def run() -> int:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
 
-    command = build_pandoc_command(context)
+    command = select_safe_pandoc_command(context)
+    write_context_debug_artifacts(context, command)
     write_log_header(context, command)
     pandoc_exit_code = run_pandoc(context, command)
     status, can_continue, failure_reason, warnings = determine_status(context, pandoc_exit_code)
@@ -612,11 +821,17 @@ def run() -> int:
         summary={
             "pandoc_exit_code": pandoc_exit_code,
             "warning_count": len(warnings),
+            "resource_dir_strategy": context.resource_dir_strategy,
+            "guard_warning_count": len(context.guard_warnings),
         },
         metrics={
             "tex_file_count": context.tex_file_count,
             "bibliography_file_count": len(context.bibliographies),
             "resource_dir_count": len(context.resource_dirs),
+            "resource_dirs_original_count": context.resource_dirs_original_count,
+            "resource_dir_limit": context.resource_dir_limit,
+            "command_length_estimate": context.command_length_estimate,
+            "command_length_limit": context.command_length_limit,
             "cite_count": context.cite_count,
         },
         notes=warnings,

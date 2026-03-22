@@ -14,6 +14,7 @@ pipeline_layout.py
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,25 @@ def now_iso_utc() -> str:
     生成 UTC 时间戳（ISO 8601）。
     """
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _emit_non_blocking_manifest_warning(
+    *,
+    work_root: Path,
+    stage: str,
+    operation: str,
+    exc: Exception,
+) -> None:
+    """
+    记录 manifest 非阻塞告警日志。
+    """
+    logging.warning(
+        "manifest best-effort update skipped (%s): stage=%s, work_root=%s, error=%s",
+        operation,
+        stage,
+        str(work_root.resolve()),
+        str(exc),
+    )
 
 
 def default_work_root_for_project(project_root: Path) -> Path:
@@ -351,10 +371,24 @@ def best_effort_update_manifest(
             summary=summary,
             notes=notes,
         )
-        if top_level_artifacts:
-            for section, section_artifacts in top_level_artifacts.items():
-                if section_artifacts is None:
-                    continue
+    except Exception as exc:
+        _emit_non_blocking_manifest_warning(
+            work_root=work_root,
+            stage=stage,
+            operation="update_stage_manifest",
+            exc=exc,
+        )
+
+    if top_level_artifacts:
+        for section, section_artifacts in top_level_artifacts.items():
+            if section_artifacts is None:
+                continue
+            try:
                 update_manifest_artifacts(work_root, section, section_artifacts)
-    except Exception:
-        return
+            except Exception as exc:
+                _emit_non_blocking_manifest_warning(
+                    work_root=work_root,
+                    stage=stage,
+                    operation=f"update_manifest_artifacts[{section}]",
+                    exc=exc,
+                )

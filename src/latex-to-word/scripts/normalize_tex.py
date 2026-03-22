@@ -1344,6 +1344,47 @@ def render_markdown_report(report: NormalizationReport) -> str:
     return "\n".join(lines)
 
 
+def persist_normalization_report(
+    *,
+    work_root: Path,
+    report: NormalizationReport,
+    json_out: Path,
+    md_out: Path,
+    normalized_source_root: Optional[Path] = None,
+    normalized_main_tex: Optional[Path] = None,
+) -> None:
+    """
+    统一写出 normalize 阶段报告，并更新 stage 级 manifest 状态。
+    """
+    write_json(json_out, asdict(report))
+    write_text_file(md_out, render_markdown_report(report))
+
+    artifacts = {
+        "normalization_report_json": json_out,
+        "normalization_report_md": md_out,
+    }
+    if normalized_source_root is not None:
+        artifacts["normalized_source_root"] = normalized_source_root
+    if normalized_main_tex is not None:
+        artifacts["normalized_main_tex"] = normalized_main_tex
+
+    best_effort_update_manifest(
+        work_root,
+        stage=STAGE_NORMALIZE,
+        status=report.status,
+        can_continue=report.can_continue,
+        artifacts=artifacts,
+        summary=report.summary,
+        metrics=report.metrics,
+        top_level_artifacts={
+            "reports": {
+                "normalization_report_json": json_out,
+                "normalization_report_md": md_out,
+            }
+        },
+    )
+
+
 # -----------------------------------------------------------------------------
 # 主入口
 # -----------------------------------------------------------------------------
@@ -1379,6 +1420,8 @@ def main() -> int:
         default_work_root_for(project_root),
     )
     normalize_stage_dir = stage_dir(work_root, STAGE_NORMALIZE)
+    json_out = normalize_stage_dir / "normalization-report.json"
+    md_out = normalize_stage_dir / "normalization-report.md"
     precheck_stage_dir = stage_dir(work_root, STAGE_PRECHECK)
     normalized_source_root = (normalize_stage_dir / "source_snapshot").resolve()
 
@@ -1437,10 +1480,12 @@ def main() -> int:
             ],
         )
 
-        json_out = normalize_stage_dir / "normalization-report.json"
-        md_out = normalize_stage_dir / "normalization-report.md"
-        write_json(json_out, asdict(report))
-        write_text_file(md_out, render_markdown_report(report))
+        persist_normalization_report(
+            work_root=work_root,
+            report=report,
+            json_out=json_out,
+            md_out=md_out,
+        )
 
         print(f"[{report.status}] normalization aborted because precheck failed.")
         print(f"JSON report: {json_out}")
@@ -1476,10 +1521,12 @@ def main() -> int:
             ],
         )
 
-        json_out = normalize_stage_dir / "normalization-report.json"
-        md_out = normalize_stage_dir / "normalization-report.md"
-        write_json(json_out, asdict(report))
-        write_text_file(md_out, render_markdown_report(report))
+        persist_normalization_report(
+            work_root=work_root,
+            report=report,
+            json_out=json_out,
+            md_out=md_out,
+        )
 
         print(f"[{report.status}] normalization failed: main TeX file could not be resolved.")
         print(f"JSON report: {json_out}")
@@ -1523,10 +1570,12 @@ def main() -> int:
             ],
         )
 
-        json_out = normalize_stage_dir / "normalization-report.json"
-        md_out = normalize_stage_dir / "normalization-report.md"
-        write_json(json_out, asdict(report))
-        write_text_file(md_out, render_markdown_report(report))
+        persist_normalization_report(
+            work_root=work_root,
+            report=report,
+            json_out=json_out,
+            md_out=md_out,
+        )
 
         print(f"[{report.status}] normalization failed: unsafe work root.")
         print(f"JSON report: {json_out}")
@@ -1582,10 +1631,12 @@ def main() -> int:
                 ],
             )
 
-            json_out = normalize_stage_dir / "normalization-report.json"
-            md_out = normalize_stage_dir / "normalization-report.md"
-            write_json(json_out, asdict(report))
-            write_text_file(md_out, render_markdown_report(report))
+            persist_normalization_report(
+                work_root=work_root,
+                report=report,
+                json_out=json_out,
+                md_out=md_out,
+            )
 
             print(f"[{report.status}] normalization failed: normalize stage already exists.")
             print(f"JSON report: {json_out}")
@@ -1670,10 +1721,14 @@ def main() -> int:
             ],
         )
 
-        json_out = normalize_stage_dir / "normalization-report.json"
-        md_out = normalize_stage_dir / "normalization-report.md"
-        write_json(json_out, asdict(report))
-        write_text_file(md_out, render_markdown_report(report))
+        persist_normalization_report(
+            work_root=work_root,
+            report=report,
+            json_out=json_out,
+            md_out=md_out,
+            normalized_source_root=normalized_source_root,
+            normalized_main_tex=normalized_main_tex,
+        )
 
         print(f"[{report.status}] normalization failed: normalized main TeX missing.")
         print(f"JSON report: {json_out}")
@@ -1718,10 +1773,14 @@ def main() -> int:
             ],
         )
 
-        json_out = normalize_stage_dir / "normalization-report.json"
-        md_out = normalize_stage_dir / "normalization-report.md"
-        write_json(json_out, asdict(report))
-        write_text_file(md_out, render_markdown_report(report))
+        persist_normalization_report(
+            work_root=work_root,
+            report=report,
+            json_out=json_out,
+            md_out=md_out,
+            normalized_source_root=normalized_source_root,
+            normalized_main_tex=normalized_main_tex,
+        )
 
         print(f"[{report.status}] normalization failed: no target TeX files found.")
         print(f"JSON report: {json_out}")
@@ -1842,30 +1901,13 @@ def main() -> int:
         recommendations=recommendations,
     )
 
-    json_out = normalize_stage_dir / "normalization-report.json"
-    md_out = normalize_stage_dir / "normalization-report.md"
-    write_json(json_out, asdict(report))
-    write_text_file(md_out, render_markdown_report(report))
-
-    best_effort_update_manifest(
-        work_root,
-        stage=STAGE_NORMALIZE,
-        status=report.status,
-        can_continue=report.can_continue,
-        artifacts={
-            "normalization_report_json": json_out,
-            "normalization_report_md": md_out,
-            "normalized_source_root": normalized_source_root,
-            "normalized_main_tex": normalized_main_tex,
-        },
-        summary=report.summary,
-        metrics=report.metrics,
-        top_level_artifacts={
-            "reports": {
-                "normalization_report_json": json_out,
-                "normalization_report_md": md_out,
-            }
-        },
+    persist_normalization_report(
+        work_root=work_root,
+        report=report,
+        json_out=json_out,
+        md_out=md_out,
+        normalized_source_root=normalized_source_root,
+        normalized_main_tex=normalized_main_tex,
     )
 
     print(f"[{report.status}] normalization completed.")
