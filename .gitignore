@@ -12,11 +12,14 @@
 !/README.md
 !AGENTS.md
 
-# 忽略examples文件夹
-src/latex-to-word/examples/
-
 # 忽略所有doc文件夹
 doc/
 
 # 忽略python中间文件
 __pycache__/
+
+# 追踪sample_project文件夹
+!src/latex-to-word/examples/sample_project/
+
+# 追踪rules文件夹
+!src/latex-to-word/rules/*.md

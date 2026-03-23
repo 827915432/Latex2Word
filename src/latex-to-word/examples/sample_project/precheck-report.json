@@ -1,0 +1,84 @@
+{
+  "status": "PASS_WITH_WARNINGS",
+  "can_continue": true,
+  "project_root": "D:\\Projects\\Latex2Word\\src\\latex-to-word\\examples\\sample_project",
+  "skill_root": "D:\\Projects\\Latex2Word\\src\\latex-to-word",
+  "main_tex": "main.tex",
+  "scanned_tex_files": [
+    "main.tex",
+    "sections\\introduction.tex"
+  ],
+  "scanned_tex_file_count": 2,
+  "findings": [
+    {
+      "severity": "WARN",
+      "code": "COMPLEX_TABLES_DETECTED",
+      "message": "检测到复杂表格文件，表格在 Word 中可能需要人工修复。",
+      "file": "main.tex",
+      "line": null,
+      "details": {
+        "files": [
+          "main.tex"
+        ]
+      }
+    },
+    {
+      "severity": "WARN",
+      "code": "HIGH_RISK_ENVIRONMENTS",
+      "message": "检测到高风险 LaTeX 环境，后续转换需重点复核。",
+      "file": "main.tex",
+      "line": null,
+      "details": {
+        "environments": {
+          "longtable": 1
+        }
+      }
+    }
+  ],
+  "metrics": {
+    "tex_file_count": 2,
+    "label_count": 4,
+    "ref_count": 8,
+    "cite_count": 2,
+    "bibliography_file_count": 1,
+    "bib_key_count": 2,
+    "image_reference_count": 1,
+    "missing_image_count": 0,
+    "environment_count": 8,
+    "custom_environment_count": 0,
+    "custom_command_count": 0,
+    "conditional_token_count": 0,
+    "complex_table_file_count": 1,
+    "finding_info_count": 0,
+    "finding_warn_count": 2,
+    "finding_error_count": 0
+  },
+  "inventory": {
+    "bibliography_files": [
+      "refs.bib"
+    ],
+    "unreadable_bibliography_files": [],
+    "high_risk_environments": {
+      "longtable": 1
+    },
+    "complex_table_files": [
+      "main.tex"
+    ],
+    "custom_environments": [],
+    "custom_commands": [],
+    "unknown_used_environments": []
+  },
+  "summary": {
+    "status": "PASS_WITH_WARNINGS",
+    "can_continue": true,
+    "main_tex_detected": "main.tex",
+    "tex_files_scanned": 2,
+    "errors": 0,
+    "warnings": 2,
+    "infos": 0
+  },
+  "recommendations": [
+    "可进入 normalize_tex.py 阶段，但需保留本预检查报告供后续脚本引用。",
+    "将复杂表格、子图、TikZ、算法和代码环境列为后续人工重点核查对象。"
+  ]
+}
