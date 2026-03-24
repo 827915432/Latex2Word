@@ -67,6 +67,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from docx_postprocess import run_docx_postprocess
 from pipeline_common import locate_skill_root, read_text_file, split_csv_payload
 from pipeline_layout import (
     STAGE_CONVERT,
@@ -93,11 +94,13 @@ class ConversionContext:
     work_root: Path
     normalization_json: Path
     main_tex: Path
+    tex_files: list[Path]
     output_docx: Path
     reference_doc: Path
     log_file: Path
     report_json: Path
     report_md: Path
+    postprocess_report_json: Path
     metadata_json: Path
     resource_dirs_txt: Path
     bibs_txt: Path
@@ -114,9 +117,11 @@ class ConversionContext:
     resource_dir_strategy: str
     command_length_limit: int
     command_length_estimate: int
+    heading_numbering_mode: str
     guard_warnings: list[str]
     normalization_report: dict
     normalized_source_root: Path
+    postprocess_report: Optional[dict]
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -158,6 +163,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=COMMAND_LENGTH_LIMIT_DEFAULT,
         help=f"Pandoc 命令长度保护阈值（默认 {COMMAND_LENGTH_LIMIT_DEFAULT}）。",
+    )
+    parser.add_argument(
+        "--heading-numbering-mode",
+        choices=["template", "pandoc"],
+        default="template",
+        help=(
+            "章节编号策略：template=依赖 reference.docx 的样式编号（不注入文本编号）；"
+            "pandoc=使用 --number-sections 注入文本编号。默认 template。"
+        ),
     )
     return parser
 
@@ -329,6 +343,12 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         STAGE_CONVERT,
         "pandoc-conversion-report.md",
     )
+    postprocess_report_json = resolve_explicit_or_stage_output(
+        None,
+        work_root,
+        STAGE_CONVERT,
+        "docx-postprocess-report.json",
+    )
 
     if not reference_doc.exists():
         raise RuntimeError(f"未找到 reference.docx: {reference_doc}")
@@ -427,11 +447,13 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         work_root=work_root,
         normalization_json=normalization_json,
         main_tex=main_tex,
+        tex_files=tex_files,
         output_docx=output_docx,
         reference_doc=reference_doc,
         log_file=log_file,
         report_json=report_json,
         report_md=report_md,
+        postprocess_report_json=postprocess_report_json,
         metadata_json=metadata_json,
         resource_dirs_txt=resource_dirs_txt,
         bibs_txt=bibs_txt,
@@ -448,9 +470,11 @@ def collect_conversion_context(args: argparse.Namespace) -> ConversionContext:
         resource_dir_strategy=resource_dir_strategy,
         command_length_limit=max(256, int(args.max_command_length)),
         command_length_estimate=0,
+        heading_numbering_mode=str(args.heading_numbering_mode),
         guard_warnings=list(guard_warnings),
         normalization_report=normalization_report,
         normalized_source_root=normalized_source_root,
+        postprocess_report=None,
     )
 
 
@@ -479,9 +503,10 @@ def build_pandoc_command(context: ConversionContext, resource_dirs: list[Path]) 
         f"--output={context.output_docx}",
         f"--reference-doc={context.reference_doc}",
         f"--resource-path={resource_path_value}",
-        "--number-sections",
         "--toc",
     ]
+    if context.heading_numbering_mode == "pandoc":
+        command.append("--number-sections")
 
     if context.bibliographies:
         command.extend(["--citeproc", "-M", "link-citations=true"])
@@ -581,9 +606,11 @@ def write_context_debug_artifacts(context: ConversionContext, command: list[str]
         "resource_dirs": [str(path) for path in context.resource_dirs],
         "command_length_limit": context.command_length_limit,
         "command_length_estimate": context.command_length_estimate,
+        "heading_numbering_mode": context.heading_numbering_mode,
         "guard_warnings": context.guard_warnings,
         "normalized_source_root": str(context.normalized_source_root),
         "command_preview": format_command_for_log(command),
+        "docx_postprocess_report_json": str(context.postprocess_report_json),
     }
     context.metadata_json.write_text(json.dumps(metadata_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     context.resource_dirs_txt.write_text("\n".join(str(path) for path in context.resource_dirs), encoding="utf-8")
@@ -607,6 +634,7 @@ def write_log_header(context: ConversionContext, command: list[str]) -> None:
         f"Resource dir limit: {context.resource_dir_limit}",
         f"Command length estimate: {context.command_length_estimate}",
         f"Command length limit: {context.command_length_limit}",
+        f"Heading numbering mode: {context.heading_numbering_mode}",
         f"Guard warning count: {len(context.guard_warnings)}",
         "",
         "Command:",
@@ -634,6 +662,73 @@ def run_pandoc(context: ConversionContext, command: list[str]) -> int:
             print(line, end="")
             log_fp.write(line)
         return process.wait()
+
+
+def write_postprocess_report_json(context: ConversionContext, payload: dict) -> None:
+    context.postprocess_report_json.parent.mkdir(parents=True, exist_ok=True)
+    context.postprocess_report_json.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def run_docx_postprocess_step(context: ConversionContext) -> None:
+    """
+    在 Pandoc 成功后执行 docx 结构后处理：
+    - 图表题注补 SEQ；
+    - 公式编号补 SEQ；
+    - 尝试修复缺失书签以改善内部跳转。
+    """
+    if not context.output_docx.exists() or context.output_docx.stat().st_size == 0:
+        payload = {
+            "status": "SKIPPED",
+            "reason": "output_docx_missing_or_empty",
+            "output_docx": str(context.output_docx),
+        }
+        context.postprocess_report = payload
+        write_postprocess_report_json(context, payload)
+        return
+
+    try:
+        result = run_docx_postprocess(
+            docx_path=context.output_docx,
+            tex_files=context.tex_files,
+        )
+        payload = {
+            "status": "PASS",
+            **result.to_dict(),
+        }
+        context.postprocess_report = payload
+        write_postprocess_report_json(context, payload)
+
+        if payload.get("warnings"):
+            for warning in payload["warnings"]:
+                context.guard_warnings.append(f"DOCX 后处理：{warning}")
+
+        modified = bool(payload.get("modified", False))
+        metrics = payload.get("metrics", {}) if isinstance(payload.get("metrics"), dict) else {}
+        print(f"[INFO] DOCX 后处理完成：modified={modified}")
+        if metrics:
+            print(
+                "[INFO] DOCX 后处理统计："
+                f" figure_seq={metrics.get('figure_caption_seq_added', 0)},"
+                f" table_seq={metrics.get('table_caption_seq_added', 0)},"
+                f" equation_seq={metrics.get('equation_seq_added', 0)},"
+                f" bookmark_added={metrics.get('bookmark_added_total', 0)},"
+                f" missing_anchor_after={metrics.get('missing_anchor_count_after', 0)}"
+            )
+    except Exception as exc:
+        message = f"DOCX 后处理失败（已降级为告警）：{exc}"
+        context.guard_warnings.append(message)
+        payload = {
+            "status": "PASS_WITH_WARNINGS",
+            "modified": False,
+            "warnings": [message],
+            "metrics": {},
+            "details": {},
+        }
+        context.postprocess_report = payload
+        write_postprocess_report_json(context, payload)
 
 
 def determine_status(context: ConversionContext, pandoc_exit_code: int) -> tuple[str, bool, str, list[str]]:
@@ -693,6 +788,7 @@ def write_conversion_reports(
         "reference_doc": str(context.reference_doc),
         "normalization_json": str(context.normalization_json),
         "pandoc_log": str(context.log_file),
+        "docx_postprocess_report_json": str(context.postprocess_report_json),
         "pandoc_exit_code": pandoc_exit_code,
         "failure_reason": failure_reason if failure_reason else None,
         "metrics": {
@@ -702,6 +798,9 @@ def write_conversion_reports(
             "resource_dir_limit": context.resource_dir_limit,
             "tex_file_count": context.tex_file_count,
             "cite_count": context.cite_count,
+            "postprocess_warning_count": len(context.postprocess_report.get("warnings", []))
+            if isinstance(context.postprocess_report, dict)
+            else 0,
         },
         "inventory": {
             "bibliographies": [str(path) for path in context.bibliographies],
@@ -717,6 +816,12 @@ def write_conversion_reports(
             "output_size_bytes": context.output_docx.stat().st_size if context.output_docx.exists() else 0,
             "command_length_estimate": context.command_length_estimate,
             "command_length_limit": context.command_length_limit,
+            "heading_numbering_mode": context.heading_numbering_mode,
+            "docx_postprocess_modified": (
+                bool(context.postprocess_report.get("modified", False))
+                if isinstance(context.postprocess_report, dict)
+                else False
+            ),
         },
         "warnings": warnings,
         "recommendations": [],
@@ -732,6 +837,10 @@ def write_conversion_reports(
 
     if warnings:
         report["recommendations"].append("存在转换告警；请在后检查和人工修复阶段重点核对这些对象。")
+    if context.heading_numbering_mode == "template":
+        report["recommendations"].append(
+            "当前采用 reference.docx 管理章节编号；请确认模板中的 Heading 样式已配置多级编号。"
+        )
 
     context.report_json.parent.mkdir(parents=True, exist_ok=True)
     context.report_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -746,6 +855,7 @@ def write_conversion_reports(
         f"- Output DOCX: `{report['output_docx']}`",
         f"- Reference DOCX: `{report['reference_doc']}`",
         f"- Pandoc log: `{report['pandoc_log']}`",
+        f"- DOCX postprocess report: `{report['docx_postprocess_report_json']}`",
         "",
         "## Summary",
         "",
@@ -794,6 +904,8 @@ def run() -> int:
     write_context_debug_artifacts(context, command)
     write_log_header(context, command)
     pandoc_exit_code = run_pandoc(context, command)
+    if pandoc_exit_code == 0:
+        run_docx_postprocess_step(context)
     status, can_continue, failure_reason, warnings = determine_status(context, pandoc_exit_code)
     write_conversion_reports(
         context=context,
@@ -816,6 +928,7 @@ def run() -> int:
             "pandoc_metadata_json": context.metadata_json,
             "pandoc_resource_dirs_txt": context.resource_dirs_txt,
             "pandoc_bibliographies_txt": context.bibs_txt,
+            "docx_postprocess_report_json": context.postprocess_report_json,
             "normalized_source_root": context.normalized_source_root,
         },
         summary={
@@ -823,6 +936,7 @@ def run() -> int:
             "warning_count": len(warnings),
             "resource_dir_strategy": context.resource_dir_strategy,
             "guard_warning_count": len(context.guard_warnings),
+            "heading_numbering_mode": context.heading_numbering_mode,
         },
         metrics={
             "tex_file_count": context.tex_file_count,
@@ -833,6 +947,11 @@ def run() -> int:
             "command_length_estimate": context.command_length_estimate,
             "command_length_limit": context.command_length_limit,
             "cite_count": context.cite_count,
+            "docx_postprocess_missing_anchor_after": (
+                int(context.postprocess_report.get("metrics", {}).get("missing_anchor_count_after", 0))
+                if isinstance(context.postprocess_report, dict)
+                else 0
+            ),
         },
         notes=warnings,
         top_level_artifacts={
@@ -842,6 +961,7 @@ def run() -> int:
             "reports": {
                 "pandoc_conversion_report_json": context.report_json,
                 "pandoc_conversion_report_md": context.report_md,
+                "docx_postprocess_report_json": context.postprocess_report_json,
             },
             "logs": {
                 "pandoc_conversion_log": context.log_file,

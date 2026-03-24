@@ -761,6 +761,22 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
                 if " TOC " in f" {raw} " or raw.strip().startswith("TOC "):
                     inventory["field_toc_count"] += 1
 
+            # 补充统计 simple field（w:fldSimple）中的字段指令：
+            # Pandoc 与部分后处理器会直接写入 w:fldSimple@w:instr，
+            # 不一定生成 w:instrText。
+            fld_simple_nodes = document_root.findall(".//w:fldSimple", NS)
+            instr_attr_name = f"{{{NS['w']}}}instr"
+            for node in fld_simple_nodes:
+                raw = (node.get(instr_attr_name, "") or "").upper()
+                if " REF " in f" {raw} " or raw.strip().startswith("REF "):
+                    inventory["field_ref_count"] += 1
+                if " PAGEREF " in f" {raw} " or raw.strip().startswith("PAGEREF "):
+                    inventory["field_pageref_count"] += 1
+                if " SEQ " in f" {raw} " or raw.strip().startswith("SEQ "):
+                    inventory["field_seq_count"] += 1
+                if " TOC " in f" {raw} " or raw.strip().startswith("TOC "):
+                    inventory["field_toc_count"] += 1
+
             # 段落级统计。
             body = document_root.find(".//w:body", NS)
             if body is None:
