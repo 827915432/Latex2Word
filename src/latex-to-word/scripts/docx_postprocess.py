@@ -440,6 +440,75 @@ def extract_label_inventory(tex_files: list[Path]) -> LabelInventory:
     )
 
 
+def _extract_labels_from_body_text(body_text: str) -> list[str]:
+    labels: list[str] = []
+    for match in LABEL_CMD_PATTERN.finditer(body_text):
+        label = (match.group(1) or "").strip()
+        if label:
+            labels.append(label)
+    return _dedup_keep_order(labels)
+
+
+def extract_float_slots(tex_files: list[Path]) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """
+    提取图/表槽位（按 TeX 环境出现顺序）。
+
+    返回：
+    - figure_slots: [{"primary_labels": [...], "all_labels": [...], "alias_to_primary": {...}}, ...]
+    - table_slots: [{"labels": [...]}, ...]
+    """
+    figure_slots: list[dict[str, object]] = []
+    table_slots: list[dict[str, object]] = []
+
+    for tex_file in tex_files:
+        try:
+            raw = tex_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw = tex_file.read_text(encoding="gbk")
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        text = _strip_comments(raw)
+
+        for figure_body in _extract_environment_bodies(text, FIGURE_ENVS):
+            primary_labels, alias_map, all_labels = _resolve_figure_labels_in_body(figure_body)
+            all_labels = _dedup_keep_order(all_labels or _extract_labels_from_body_text(figure_body))
+            primary_labels = _dedup_keep_order(primary_labels)
+
+            # 若未从 caption 语义中确定 primary，则退化为首个标签。
+            if not primary_labels and all_labels:
+                primary_labels = [all_labels[0]]
+
+            normalized_alias: dict[str, str] = {}
+            for alias, primary in alias_map.items():
+                alias_key = alias.strip()
+                primary_key = primary.strip()
+                if not alias_key or not primary_key:
+                    continue
+                if alias_key in normalized_alias:
+                    continue
+                normalized_alias[alias_key] = primary_key
+            for primary_label in primary_labels:
+                if primary_label not in normalized_alias:
+                    normalized_alias[primary_label] = primary_label
+
+            figure_slots.append(
+                {
+                    "primary_labels": primary_labels,
+                    "all_labels": all_labels,
+                    "alias_to_primary": normalized_alias,
+                }
+            )
+
+        for table_body in _extract_environment_bodies(text, TABLE_ENVS):
+            table_slots.append({"labels": _extract_labels_from_body_text(table_body)})
+
+    return figure_slots, table_slots
+
+
 def extract_equation_display_slots(tex_files: list[Path]) -> list[dict[str, object]]:
     """
     提取“显示级公式槽位”列表，并保留每个槽位中的标签集合（可为空）。
@@ -1020,6 +1089,174 @@ def _align_label_pairs_to_captions(
     return pairs, _dedup_keep_order(skipped_labels), alias_suggestions
 
 
+def _slot_labels_for_pairing(
+    slot: dict[str, object],
+    *,
+    object_kind: str,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """
+    统一读取槽位中的 primary/all/alias 信息。
+    """
+    if object_kind == "figure":
+        raw_primary = slot.get("primary_labels", [])
+        raw_all = slot.get("all_labels", [])
+        raw_alias = slot.get("alias_to_primary", {})
+
+        primary_labels = _dedup_keep_order(str(v) for v in raw_primary) if isinstance(raw_primary, list) else []
+        all_labels = _dedup_keep_order(str(v) for v in raw_all) if isinstance(raw_all, list) else []
+        if not all_labels:
+            all_labels = list(primary_labels)
+        if not primary_labels and all_labels:
+            primary_labels = [all_labels[0]]
+
+        alias_to_primary: dict[str, str] = {}
+        if isinstance(raw_alias, dict):
+            for alias, primary in raw_alias.items():
+                alias_key = str(alias).strip()
+                primary_key = str(primary).strip()
+                if not alias_key or not primary_key:
+                    continue
+                if alias_key in alias_to_primary:
+                    continue
+                alias_to_primary[alias_key] = primary_key
+        return primary_labels, all_labels, alias_to_primary
+
+    raw_labels = slot.get("labels", [])
+    labels = _dedup_keep_order(str(v) for v in raw_labels) if isinstance(raw_labels, list) else []
+    return labels, labels, {}
+
+
+def _build_caption_label_pairs_by_slots(
+    *,
+    object_kind: str,
+    caption_paragraphs: list[ET.Element],
+    slots: list[dict[str, object]],
+    fallback_labels: list[str],
+) -> tuple[list[tuple[ET.Element, str]], list[str], dict[str, str], str, list[str]]:
+    """
+    基于 TeX 槽位驱动图/表 (caption, label) 配对。
+
+    返回：
+    - label_pairs
+    - skipped_labels（槽位配对中被跳过的标签）
+    - alias_suggestions（alias -> primary）
+    - pairing_strategy: slots / slots_mismatch_resync / fallback_label_alignment / no_caption
+    - pairing_warnings
+    """
+    warnings: list[str] = []
+    pairs: list[tuple[ET.Element, str]] = []
+    skipped_labels: list[str] = []
+    alias_suggestions: dict[str, str] = {}
+
+    if not caption_paragraphs:
+        return pairs, skipped_labels, alias_suggestions, "no_caption", warnings
+
+    if not slots:
+        warnings.append(
+            f"未提取到 {object_kind} TeX 槽位，已回退到标签-题注顺序对齐（fallback_label_alignment）。"
+        )
+        fallback_pairs, fallback_skipped, fallback_alias = _align_label_pairs_to_captions(
+            caption_paragraphs,
+            fallback_labels,
+        )
+        return fallback_pairs, fallback_skipped, fallback_alias, "fallback_label_alignment", warnings
+
+    cap_texts = [_paragraph_text(paragraph) for paragraph in caption_paragraphs]
+
+    slot_primaries: list[list[str]] = []
+    slot_all_labels: list[list[str]] = []
+    slot_alias_maps: list[dict[str, str]] = []
+    for slot in slots:
+        primary_labels, all_labels, alias_map = _slot_labels_for_pairing(slot, object_kind=object_kind)
+        slot_primaries.append(primary_labels)
+        slot_all_labels.append(all_labels)
+        slot_alias_maps.append(alias_map)
+
+    labeled_slot_suffix: list[int] = [0] * (len(slots) + 1)
+    for idx in range(len(slots) - 1, -1, -1):
+        labeled_slot_suffix[idx] = labeled_slot_suffix[idx + 1] + (1 if slot_primaries[idx] else 0)
+
+    slot_index = 0
+    caption_index = 0
+    while slot_index < len(slots) and caption_index < len(caption_paragraphs):
+        primary_labels = slot_primaries[slot_index]
+        all_labels = slot_all_labels[slot_index]
+        alias_map = slot_alias_maps[slot_index]
+
+        if not primary_labels:
+            # 无标签槽位只用于占位，保持与题注位置同步推进。
+            slot_index += 1
+            caption_index += 1
+            continue
+
+        primary = primary_labels[0]
+        caption_text = cap_texts[caption_index]
+        score_current = _label_caption_similarity(primary, caption_text)
+
+        next_labeled_slot = -1
+        for pos in range(slot_index + 1, len(slots)):
+            if slot_primaries[pos]:
+                next_labeled_slot = pos
+                break
+
+        score_next = -1.0
+        next_primary = ""
+        if next_labeled_slot >= 0:
+            next_primary = slot_primaries[next_labeled_slot][0]
+            score_next = _label_caption_similarity(next_primary, caption_text)
+
+        remaining_labeled_slots = labeled_slot_suffix[slot_index]
+        remaining_captions = len(caption_paragraphs) - caption_index
+        can_skip_slot = remaining_labeled_slots > remaining_captions
+        should_skip = False
+
+        if can_skip_slot and next_labeled_slot >= 0:
+            if score_next >= 0.33 and score_next >= score_current + 0.08:
+                should_skip = True
+            elif score_current < 0.2 and score_next > score_current + 0.03:
+                should_skip = True
+
+        if should_skip:
+            skipped_labels.extend(all_labels)
+            for alias_label in all_labels:
+                if not alias_label or alias_label == next_primary:
+                    continue
+                alias_suggestions.setdefault(alias_label, next_primary)
+            slot_index += 1
+            continue
+
+        pairs.append((caption_paragraphs[caption_index], primary))
+        for alias_label in all_labels:
+            if alias_label and alias_label != primary:
+                alias_suggestions.setdefault(alias_label, primary)
+        for alias_label, target_label in alias_map.items():
+            if not alias_label or not target_label:
+                continue
+            if target_label == primary:
+                alias_suggestions.setdefault(alias_label, primary)
+
+        slot_index += 1
+        caption_index += 1
+
+    if slot_index < len(slots):
+        for pos in range(slot_index, len(slots)):
+            skipped_labels.extend(slot_all_labels[pos])
+
+    strategy = "slots" if len(slots) == len(caption_paragraphs) else "slots_mismatch_resync"
+    if strategy == "slots_mismatch_resync":
+        warnings.append(
+            f"{object_kind} 槽位数与 docx 题注段落数不一致，已采用槽位驱动重同步配对（slots_mismatch_resync）。"
+        )
+
+    return (
+        pairs,
+        _dedup_keep_order(skipped_labels),
+        alias_suggestions,
+        strategy,
+        warnings,
+    )
+
+
 def _add_bookmark(
     paragraph: ET.Element,
     *,
@@ -1585,18 +1822,33 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         ):
             table_seq_added += 1
 
-    figure_label_pairs, figure_labels_skipped_by_alignment, figure_alias_suggestions = (
-        _align_label_pairs_to_captions(
-            figure_caption_paragraphs,
-            inventory.figure_labels,
-        )
+    figure_slots, table_slots = extract_float_slots(tex_files)
+    (
+        figure_label_pairs,
+        figure_labels_skipped_by_pairing,
+        figure_alias_suggestions,
+        figure_pairing_strategy,
+        figure_pairing_warnings,
+    ) = _build_caption_label_pairs_by_slots(
+        object_kind="figure",
+        caption_paragraphs=figure_caption_paragraphs,
+        slots=figure_slots,
+        fallback_labels=inventory.figure_labels,
     )
-    table_label_pairs, table_labels_skipped_by_alignment, _table_alias_suggestions = (
-        _align_label_pairs_to_captions(
-            table_caption_paragraphs,
-            inventory.table_labels,
-        )
+    (
+        table_label_pairs,
+        table_labels_skipped_by_pairing,
+        _table_alias_suggestions,
+        table_pairing_strategy,
+        table_pairing_warnings,
+    ) = _build_caption_label_pairs_by_slots(
+        object_kind="table",
+        caption_paragraphs=table_caption_paragraphs,
+        slots=table_slots,
+        fallback_labels=inventory.table_labels,
     )
+    warnings.extend(figure_pairing_warnings)
+    warnings.extend(table_pairing_warnings)
     equation_slots = extract_equation_display_slots(tex_files)
     (
         equation_label_pairs,
@@ -1842,6 +2094,8 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_caption_para_count": len(figure_caption_paragraphs),
         "table_caption_para_count": len(table_caption_paragraphs),
         "display_equation_para_count": len(display_equation_paragraphs),
+        "figure_slot_count_from_tex": len(figure_slots),
+        "table_slot_count_from_tex": len(table_slots),
         "figure_label_count_from_tex": len(inventory.figure_all_labels),
         "figure_label_primary_count_from_tex": len(inventory.figure_labels),
         "table_label_count_from_tex": len(inventory.table_labels),
@@ -1852,8 +2106,12 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "equation_unlabeled_equation_numbered_count": equation_unlabeled_equation_numbered_count,
         "figure_label_pair_count": len(figure_label_pairs),
         "table_label_pair_count": len(table_label_pairs),
-        "figure_labels_skipped_by_alignment_count": len(figure_labels_skipped_by_alignment),
-        "table_labels_skipped_by_alignment_count": len(table_labels_skipped_by_alignment),
+        "figure_labels_skipped_by_pairing_count": len(figure_labels_skipped_by_pairing),
+        "table_labels_skipped_by_pairing_count": len(table_labels_skipped_by_pairing),
+        "figure_labels_skipped_by_alignment_count": len(figure_labels_skipped_by_pairing),
+        "table_labels_skipped_by_alignment_count": len(table_labels_skipped_by_pairing),
+        "figure_pairing_warning_count": len(figure_pairing_warnings),
+        "table_pairing_warning_count": len(table_pairing_warnings),
         "equation_pairing_warning_count": len(equation_pairing_warnings),
         "figure_caption_seq_added": figure_seq_added,
         "table_caption_seq_added": table_seq_added,
@@ -1909,8 +2167,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_primary_with_alias_count": sum(
             1 for labels in figure_aliases_by_primary.values() if len(labels) > 1
         ),
-        "figure_labels_skipped_by_alignment": figure_labels_skipped_by_alignment[:50],
-        "table_labels_skipped_by_alignment": table_labels_skipped_by_alignment[:50],
+        "figure_pairing_strategy": figure_pairing_strategy,
+        "table_pairing_strategy": table_pairing_strategy,
+        "figure_pairing_warnings": figure_pairing_warnings[:20],
+        "table_pairing_warnings": table_pairing_warnings[:20],
+        "figure_labels_skipped_by_pairing": figure_labels_skipped_by_pairing[:50],
+        "table_labels_skipped_by_pairing": table_labels_skipped_by_pairing[:50],
+        "figure_labels_skipped_by_alignment": figure_labels_skipped_by_pairing[:50],
+        "table_labels_skipped_by_alignment": table_labels_skipped_by_pairing[:50],
         "figure_alias_suggestions_applied": {
             alias: primary
             for alias, primary in figure_alias_suggestions.items()
@@ -1946,17 +2210,17 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "figure 标签数量大于 docx 可识别图题段落数量，部分 figure 书签无法自动修复。"
         )
-    if figure_labels_skipped_by_alignment:
+    if figure_labels_skipped_by_pairing:
         warnings.append(
-            f"figure 标签-题注对齐中跳过 {len(figure_labels_skipped_by_alignment)} 个标签（疑似子图或被 Pandoc 合并的子题注）。"
+            f"figure 槽位配对中跳过 {len(figure_labels_skipped_by_pairing)} 个标签（疑似子图或被 Pandoc 合并的子题注）。"
         )
     if len(inventory.table_labels) > len(table_caption_paragraphs):
         warnings.append(
             "table 标签数量大于 docx 可识别表题段落数量，部分 table 书签无法自动修复。"
         )
-    if table_labels_skipped_by_alignment:
+    if table_labels_skipped_by_pairing:
         warnings.append(
-            f"table 标签-题注对齐中跳过 {len(table_labels_skipped_by_alignment)} 个标签（疑似被 Pandoc 合并或丢失题注）。"
+            f"table 槽位配对中跳过 {len(table_labels_skipped_by_pairing)} 个标签（疑似被 Pandoc 合并或丢失题注）。"
         )
     if len(inventory.equation_labels) > len(display_equation_paragraphs):
         warnings.append(
