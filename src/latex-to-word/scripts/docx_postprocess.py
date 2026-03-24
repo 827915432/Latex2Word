@@ -66,11 +66,14 @@ EQUATION_ENVS = {
 }
 
 TOKEN_PATTERN = re.compile(r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+)\}")
+LABEL_CMD_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
 
 
 @dataclass
 class LabelInventory:
     figure_labels: list[str] = field(default_factory=list)
+    figure_all_labels: list[str] = field(default_factory=list)
+    figure_label_alias_to_primary: dict[str, str] = field(default_factory=dict)
     table_labels: list[str] = field(default_factory=list)
     equation_labels: list[str] = field(default_factory=list)
 
@@ -131,8 +134,202 @@ def _dedup_keep_order(values: Iterable[str]) -> list[str]:
     return result
 
 
+def _skip_whitespace(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _parse_balanced_group(text: str, start: int, open_char: str, close_char: str) -> int | None:
+    if start >= len(text) or text[start] != open_char:
+        return None
+
+    depth = 0
+    idx = start
+    while idx < len(text):
+        ch = text[idx]
+        if ch == "\\":
+            idx += 2
+            continue
+        if ch == open_char:
+            depth += 1
+        elif ch == close_char:
+            depth -= 1
+            if depth == 0:
+                return idx + 1
+        idx += 1
+    return None
+
+
+def _find_command_spans(text: str, command_name: str) -> list[tuple[int, int]]:
+    pattern = re.compile(rf"\\{re.escape(command_name)}(?![A-Za-z@*])")
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        match = pattern.search(text, cursor)
+        if not match:
+            break
+
+        pos = _skip_whitespace(text, match.end())
+        if pos < len(text) and text[pos] == "[":
+            opt_end = _parse_balanced_group(text, pos, "[", "]")
+            if opt_end is None:
+                cursor = match.end()
+                continue
+            pos = _skip_whitespace(text, opt_end)
+
+        if pos >= len(text) or text[pos] != "{":
+            cursor = match.end()
+            continue
+
+        body_end = _parse_balanced_group(text, pos, "{", "}")
+        if body_end is None:
+            cursor = match.end()
+            continue
+
+        spans.append((match.start(), body_end))
+        cursor = body_end
+
+    return spans
+
+
+def _extract_environment_bodies(text: str, target_envs: set[str]) -> list[str]:
+    bodies: list[str] = []
+    stack: list[tuple[str, int]] = []
+
+    for match in TOKEN_PATTERN.finditer(text):
+        begin_env = match.group(1)
+        end_env = match.group(2)
+        if begin_env:
+            stack.append((begin_env.strip().lower(), match.end()))
+            continue
+
+        if not end_env:
+            continue
+        env = end_env.strip().lower()
+        if not stack:
+            continue
+
+        for pos in range(len(stack) - 1, -1, -1):
+            stack_env, body_start = stack[pos]
+            if stack_env != env:
+                continue
+            if env in target_envs and body_start <= match.start():
+                bodies.append(text[body_start:match.start()])
+            stack = stack[:pos]
+            break
+
+    return bodies
+
+
+def _bind_alias(alias_to_primary: dict[str, str], *, alias: str, primary: str) -> None:
+    alias_key = alias.strip()
+    primary_key = primary.strip()
+    if not alias_key or not primary_key:
+        return
+    if alias_key not in alias_to_primary:
+        alias_to_primary[alias_key] = primary_key
+
+
+def _resolve_figure_labels_in_body(body_text: str) -> tuple[list[str], dict[str, str], list[str]]:
+    label_entries: list[tuple[int, str]] = []
+    for match in LABEL_CMD_PATTERN.finditer(body_text):
+        label = (match.group(1) or "").strip()
+        if label:
+            label_entries.append((match.start(), label))
+
+    if not label_entries:
+        return [], {}, []
+
+    all_labels = _dedup_keep_order(label for _, label in label_entries)
+    caption_spans = _find_command_spans(body_text, "caption")
+    if not caption_spans:
+        primary_labels = list(all_labels)
+        alias_map = {label: label for label in primary_labels}
+        return primary_labels, alias_map, all_labels
+
+    primary_labels: list[str] = []
+    alias_to_primary: dict[str, str] = {}
+    consumed_label_indexes: set[int] = set()
+    caption_primary_labels: list[str | None] = [None for _ in caption_spans]
+
+    for cap_idx, (caption_start, caption_end) in enumerate(caption_spans):
+        prev_caption_end = caption_spans[cap_idx - 1][1] if cap_idx > 0 else 0
+        next_caption_start = caption_spans[cap_idx + 1][0] if cap_idx + 1 < len(caption_spans) else len(body_text)
+
+        after_region = [
+            idx
+            for idx, (pos, _label) in enumerate(label_entries)
+            if idx not in consumed_label_indexes and caption_end <= pos < next_caption_start
+        ]
+        before_region = [
+            idx
+            for idx, (pos, _label) in enumerate(label_entries)
+            if idx not in consumed_label_indexes and prev_caption_end <= pos < caption_start
+        ]
+
+        region = after_region if after_region else before_region
+        if not region:
+            continue
+
+        primary_idx = region[0] if after_region else region[-1]
+        primary_label = label_entries[primary_idx][1]
+        caption_primary_labels[cap_idx] = primary_label
+        if primary_label not in primary_labels:
+            primary_labels.append(primary_label)
+
+        for idx in region:
+            _bind_alias(alias_to_primary, alias=label_entries[idx][1], primary=primary_label)
+            consumed_label_indexes.add(idx)
+
+    if not any(caption_primary_labels):
+        fallback_label = label_entries[-1][1]
+        if fallback_label not in primary_labels:
+            primary_labels.append(fallback_label)
+        caption_primary_labels[-1] = fallback_label
+        _bind_alias(alias_to_primary, alias=fallback_label, primary=fallback_label)
+
+    for idx, (pos, label) in enumerate(label_entries):
+        if idx in consumed_label_indexes:
+            continue
+
+        best_primary = None
+        best_distance = None
+        for cap_idx, (caption_start, _caption_end) in enumerate(caption_spans):
+            primary = caption_primary_labels[cap_idx]
+            if not primary:
+                continue
+            distance = abs(pos - caption_start)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_primary = primary
+
+        if best_primary is None:
+            if label not in primary_labels:
+                primary_labels.append(label)
+            best_primary = label
+
+        _bind_alias(alias_to_primary, alias=label, primary=best_primary)
+
+    caption_primaries = _dedup_keep_order(label for label in caption_primary_labels if label)
+    if len(caption_spans) > 1 and caption_primaries:
+        canonical_primary = caption_primaries[-1]
+        collapsed_alias: dict[str, str] = {}
+        for _, label in label_entries:
+            _bind_alias(collapsed_alias, alias=label, primary=canonical_primary)
+        for alias in alias_to_primary.keys():
+            _bind_alias(collapsed_alias, alias=alias, primary=canonical_primary)
+        alias_to_primary = collapsed_alias
+        primary_labels = [canonical_primary]
+
+    return _dedup_keep_order(primary_labels), alias_to_primary, all_labels
+
+
 def extract_label_inventory(tex_files: list[Path]) -> LabelInventory:
-    figure_labels: list[str] = []
+    figure_primary_labels: list[str] = []
+    figure_all_labels: list[str] = []
+    figure_label_alias_to_primary: dict[str, str] = {}
+    figure_fallback_labels: list[str] = []
     table_labels: list[str] = []
     equation_labels: list[str] = []
 
@@ -148,6 +345,18 @@ def extract_label_inventory(tex_files: list[Path]) -> LabelInventory:
             continue
 
         text = _strip_comments(raw)
+
+        for figure_body in _extract_environment_bodies(text, FIGURE_ENVS):
+            primary_labels, alias_map, all_labels = _resolve_figure_labels_in_body(figure_body)
+            figure_primary_labels.extend(primary_labels)
+            figure_all_labels.extend(all_labels)
+            for alias, primary in alias_map.items():
+                _bind_alias(
+                    figure_label_alias_to_primary,
+                    alias=alias,
+                    primary=primary,
+                )
+
         stack: list[str] = []
 
         for match in TOKEN_PATTERN.finditer(text):
@@ -177,14 +386,36 @@ def extract_label_inventory(tex_files: list[Path]) -> LabelInventory:
 
             env_set = set(stack)
             if env_set & FIGURE_ENVS:
-                figure_labels.append(label_key)
+                figure_fallback_labels.append(label_key)
             elif env_set & TABLE_ENVS:
                 table_labels.append(label_key)
             elif env_set & EQUATION_ENVS:
                 equation_labels.append(label_key)
 
+    figure_primary_labels = _dedup_keep_order(figure_primary_labels)
+    figure_all_labels = _dedup_keep_order(figure_all_labels + figure_fallback_labels)
+
+    if not figure_primary_labels:
+        figure_primary_labels = _dedup_keep_order(figure_fallback_labels)
+
+    normalized_alias: dict[str, str] = {}
+    for alias, primary in figure_label_alias_to_primary.items():
+        alias_key = alias.strip()
+        primary_key = primary.strip()
+        if not alias_key or not primary_key:
+            continue
+        if alias_key in normalized_alias:
+            continue
+        normalized_alias[alias_key] = primary_key
+
+    for label in figure_primary_labels:
+        if label not in normalized_alias:
+            normalized_alias[label] = label
+
     return LabelInventory(
-        figure_labels=_dedup_keep_order(figure_labels),
+        figure_labels=figure_primary_labels,
+        figure_all_labels=figure_all_labels,
+        figure_label_alias_to_primary=normalized_alias,
         table_labels=_dedup_keep_order(table_labels),
         equation_labels=_dedup_keep_order(equation_labels),
     )
@@ -585,6 +816,11 @@ def _number_bookmark_name(object_kind: str, label: str) -> str:
     return f"{prefix}_{digest}"
 
 
+def _subfigure_marker_bookmark_name(label: str) -> str:
+    digest = hashlib.sha1(label.strip().encode("utf-8")).hexdigest()[:32]
+    return f"figSub_{digest}"
+
+
 def _normalize_for_similarity(text: str) -> str:
     return re.sub(r"\s+", "", text or "").strip()
 
@@ -600,6 +836,89 @@ def _char_jaccard(lhs: str, rhs: str) -> float:
     if not union:
         return 0.0
     return len(left_set & right_set) / len(union)
+
+
+def _label_text_for_match(label: str) -> str:
+    token = (label or "").strip()
+    if ":" in token:
+        token = token.split(":", 1)[1]
+    return _normalize_for_similarity(token.replace("_", ""))
+
+
+def _caption_text_for_match(text: str) -> str:
+    compact = _normalize_for_similarity(text)
+    # 兼容“图 1 xxx / 表 1 xxx / Figure 1 xxx / Table 1 xxx”等前缀。
+    compact = re.sub(r"^(图|表|figure|table|fig\.?)[\d\.\-_:：]*", "", compact, flags=re.IGNORECASE)
+    return compact
+
+
+def _label_caption_similarity(label: str, caption_text: str) -> float:
+    label_text = _label_text_for_match(label)
+    caption_text_normalized = _caption_text_for_match(caption_text)
+    if not label_text or not caption_text_normalized:
+        return 0.0
+    if label_text in caption_text_normalized:
+        return 1.0
+    return _char_jaccard(label_text, caption_text_normalized)
+
+
+def _align_label_pairs_to_captions(
+    caption_paragraphs: list[ET.Element],
+    labels: list[str],
+) -> tuple[list[tuple[ET.Element, str]], list[str], dict[str, str]]:
+    """
+    对 (caption, label) 做单调对齐：
+    - 默认按顺序一一配对；
+    - 当标签数量多于题注数量且“下一个标签”明显更像当前题注时，跳过当前标签；
+    - 记录跳过标签的别名建议（alias -> next_label），用于 figure REF 映射补偿。
+    """
+    pairs: list[tuple[ET.Element, str]] = []
+    skipped_labels: list[str] = []
+    alias_suggestions: dict[str, str] = {}
+
+    if not caption_paragraphs or not labels:
+        return pairs, skipped_labels, alias_suggestions
+
+    cap_texts = [_paragraph_text(paragraph) for paragraph in caption_paragraphs]
+    label_index = 0
+    caption_index = 0
+
+    while label_index < len(labels) and caption_index < len(caption_paragraphs):
+        label = labels[label_index]
+        caption_text = cap_texts[caption_index]
+        score_current = _label_caption_similarity(label, caption_text)
+
+        score_next = -1.0
+        has_next_label = label_index + 1 < len(labels)
+        if has_next_label:
+            score_next = _label_caption_similarity(labels[label_index + 1], caption_text)
+
+        remaining_labels = len(labels) - label_index
+        remaining_captions = len(caption_paragraphs) - caption_index
+        can_skip_label = remaining_labels > remaining_captions
+        should_skip = False
+
+        if can_skip_label and has_next_label:
+            if score_next >= 0.33 and score_next >= score_current + 0.08:
+                should_skip = True
+            elif score_current < 0.2 and score_next > score_current + 0.03:
+                should_skip = True
+
+        if should_skip:
+            skipped = labels[label_index]
+            skipped_labels.append(skipped)
+            alias_suggestions.setdefault(skipped, labels[label_index + 1])
+            label_index += 1
+            continue
+
+        pairs.append((caption_paragraphs[caption_index], label))
+        label_index += 1
+        caption_index += 1
+
+    if label_index < len(labels):
+        skipped_labels.extend(labels[label_index:])
+
+    return pairs, _dedup_keep_order(skipped_labels), alias_suggestions
 
 
 def _add_bookmark(
@@ -653,6 +972,134 @@ def _insert_bookmark_around_child(
     return True
 
 
+def _find_subcaption_marker_run(paragraph: ET.Element) -> tuple[ET.Element | None, str]:
+    marker_pattern = re.compile(r"^[\s\u00A0]*([\(（]\s*[A-Za-z0-9]+\s*[\)）])")
+    for child in list(paragraph):
+        if child.tag != wqn("r"):
+            continue
+        text = _run_text(child)
+        if not text:
+            continue
+        match = marker_pattern.match(text)
+        if not match:
+            continue
+        marker_text = match.group(1)
+        if marker_text.startswith("（") and marker_text.endswith("）"):
+            marker_text = "(" + marker_text[1:-1].strip() + ")"
+        else:
+            marker_text = marker_text.replace("（", "(").replace("）", ")")
+        marker_text = re.sub(r"\s+", "", marker_text)
+        return child, marker_text
+    return None, ""
+
+
+def _build_subfigure_ref_mapping(
+    *,
+    document_root: ET.Element,
+    labels: list[str],
+    existing_bookmarks: set[str],
+    bookmark_id_seed: int,
+) -> tuple[dict[str, str], dict[str, str], int, int, list[str], list[str]]:
+    """
+    为子图标签构建 REF 映射：
+    - 在子图单元格题注行 `(a)/(b)` 处补充书签；
+    - 将子图标签 anchor 映射到该书签，用于 \subref 的 REF 字段升级。
+    """
+    next_id = bookmark_id_seed
+    bookmark_added = 0
+    labels_bound = 0
+    labels_missing_marker: list[str] = []
+    if not labels:
+        return {}, {}, bookmark_added, labels_bound, labels_missing_marker, []
+
+    dedup_labels = _dedup_keep_order(labels)
+    anchor_to_label: dict[str, str] = {}
+    for label in dedup_labels:
+        for anchor_name in _candidate_anchor_names(label):
+            anchor_to_label.setdefault(anchor_name, label)
+
+    label_to_marker_bookmark: dict[str, str] = {}
+    label_to_marker_text: dict[str, str] = {}
+    encountered_labels: set[str] = set()
+
+    for table_cell in document_root.findall(".//w:tc", NS):
+        paragraphs = table_cell.findall("./w:p", NS)
+        if not paragraphs:
+            continue
+
+        for index, paragraph in enumerate(paragraphs):
+            bookmark_names = [
+                (node.get(wqn("name"), "") or "").strip()
+                for node in paragraph.findall(".//w:bookmarkStart", NS)
+            ]
+            candidate_labels = _dedup_keep_order(
+                anchor_to_label[name]
+                for name in bookmark_names
+                if name in anchor_to_label
+            )
+            if not candidate_labels:
+                continue
+            encountered_labels.update(candidate_labels)
+
+            marker_paragraph = None
+            marker_run = None
+            marker_text = ""
+            for probe_index in range(index, min(index + 3, len(paragraphs))):
+                run, marker = _find_subcaption_marker_run(paragraphs[probe_index])
+                if run is None:
+                    continue
+                marker_paragraph = paragraphs[probe_index]
+                marker_run = run
+                marker_text = marker
+                break
+
+            if marker_paragraph is None or marker_run is None:
+                continue
+
+            for label in candidate_labels:
+                if label in label_to_marker_bookmark:
+                    continue
+                marker_bookmark = _subfigure_marker_bookmark_name(label)
+                if marker_bookmark not in existing_bookmarks:
+                    wrapped = _insert_bookmark_around_child(
+                        marker_paragraph,
+                        marker_run,
+                        bookmark_name=marker_bookmark,
+                        bookmark_id=next_id,
+                    )
+                    if wrapped:
+                        existing_bookmarks.add(marker_bookmark)
+                        next_id += 1
+                        bookmark_added += 1
+                if marker_bookmark in existing_bookmarks:
+                    label_to_marker_bookmark[label] = marker_bookmark
+                    label_to_marker_text[label] = marker_text
+
+    mapping: dict[str, str] = {}
+    display_text: dict[str, str] = {}
+    detected_labels = _dedup_keep_order(label for label in dedup_labels if label in encountered_labels)
+    for label in detected_labels:
+        marker_bookmark = label_to_marker_bookmark.get(label)
+        if not marker_bookmark:
+            labels_missing_marker.append(label)
+            continue
+        labels_bound += 1
+        marker_text = label_to_marker_text.get(label, "")
+        for anchor_name in _candidate_anchor_names(label):
+            mapping.setdefault(anchor_name, marker_bookmark)
+            if marker_text:
+                display_text.setdefault(anchor_name, marker_text)
+
+    return (
+        mapping,
+        display_text,
+        bookmark_added,
+        labels_bound,
+        _dedup_keep_order(labels_missing_marker),
+        detected_labels,
+    )
+
+
 def _repair_label_bookmarks(
     *,
     label_pairs: list[tuple[ET.Element, str]],
@@ -682,9 +1129,35 @@ def _repair_label_bookmarks(
     return added, touched_labels
 
 
+def _group_aliases_by_primary(
+    alias_to_primary: dict[str, str],
+    primary_labels: list[str],
+) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for primary in primary_labels:
+        key = primary.strip()
+        if not key or key in grouped:
+            continue
+        grouped[key] = [key]
+
+    for alias, primary in alias_to_primary.items():
+        alias_key = alias.strip()
+        primary_key = primary.strip()
+        if not alias_key or not primary_key:
+            continue
+        bucket = grouped.get(primary_key)
+        if bucket is None:
+            continue
+        if alias_key not in bucket:
+            bucket.append(alias_key)
+
+    return grouped
+
+
 def _build_caption_ref_bookmark_mapping(
     *,
     label_pairs: list[tuple[ET.Element, str]],
+    label_aliases_by_primary: dict[str, list[str]] | None,
     existing_bookmarks: set[str],
     bookmark_id_seed: int,
     seq_name: str,
@@ -727,8 +1200,15 @@ def _build_caption_ref_bookmark_mapping(
             added += 1
 
         labels_bound += 1
-        for anchor_name in _candidate_anchor_names(label_key):
-            mapping[anchor_name] = number_bookmark
+        alias_labels = [label_key]
+        if label_aliases_by_primary:
+            alias_labels = label_aliases_by_primary.get(label_key, alias_labels)
+        for alias_label in alias_labels:
+            alias_key = alias_label.strip()
+            if not alias_key:
+                continue
+            for anchor_name in _candidate_anchor_names(alias_key):
+                mapping.setdefault(anchor_name, number_bookmark)
 
     return mapping, added, labels_bound, labels_missing_seq
 
@@ -737,6 +1217,7 @@ def _convert_hyperlinks_to_ref_fields(
     document_root: ET.Element,
     *,
     anchor_to_number_bookmark: dict[str, str],
+    anchor_display_text: dict[str, str] | None = None,
 ) -> tuple[int, int, int]:
     """
     将文内 hyperlink(anchor) 转换为 REF 字段（仅处理传入映射中的锚点）。
@@ -763,7 +1244,10 @@ def _convert_hyperlinks_to_ref_fields(
 
             candidate += 1
             candidate_anchor_names.add(anchor_name)
-            display_text = "".join((node.text or "") for node in child.findall(".//w:t", NS))
+            preferred_text = ""
+            if anchor_display_text:
+                preferred_text = anchor_display_text.get(anchor_name, "")
+            display_text = preferred_text or "".join((node.text or "") for node in child.findall(".//w:t", NS))
             ref_field = _make_ref_field(bookmark_name, display_text)
 
             insertion_index = list(paragraph).index(child)
@@ -924,9 +1408,33 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         ):
             table_seq_added += 1
 
-    figure_label_pairs = list(zip(figure_caption_paragraphs, inventory.figure_labels))
-    table_label_pairs = list(zip(table_caption_paragraphs, inventory.table_labels))
+    figure_label_pairs, figure_labels_skipped_by_alignment, figure_alias_suggestions = (
+        _align_label_pairs_to_captions(
+            figure_caption_paragraphs,
+            inventory.figure_labels,
+        )
+    )
+    table_label_pairs, table_labels_skipped_by_alignment, _table_alias_suggestions = (
+        _align_label_pairs_to_captions(
+            table_caption_paragraphs,
+            inventory.table_labels,
+        )
+    )
     equation_label_pairs = list(zip(display_equation_paragraphs, inventory.equation_labels))
+    figure_aliases_by_primary = _group_aliases_by_primary(
+        inventory.figure_label_alias_to_primary,
+        inventory.figure_labels,
+    )
+    paired_figure_labels = {label for _paragraph, label in figure_label_pairs}
+    for alias_label, primary_label in figure_alias_suggestions.items():
+        if primary_label not in paired_figure_labels:
+            continue
+        bucket = figure_aliases_by_primary.get(primary_label)
+        if bucket is None:
+            bucket = [primary_label]
+            figure_aliases_by_primary[primary_label] = bucket
+        if alias_label not in bucket:
+            bucket.append(alias_label)
 
     bookmark_added_figure, figure_label_repaired = _repair_label_bookmarks(
         label_pairs=figure_label_pairs,
@@ -973,9 +1481,30 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += bookmark_added_equation
 
+    figure_anchor_labels = inventory.figure_all_labels or inventory.figure_labels
+    subfigure_candidate_labels = [
+        label
+        for label in figure_anchor_labels
+        if inventory.figure_label_alias_to_primary.get(label, label) != label
+    ]
+    (
+        subfigure_ref_mapping,
+        subfigure_ref_display_text,
+        subfigure_marker_bookmark_added,
+        subfigure_labels_bound,
+        subfigure_labels_missing_marker,
+        subfigure_detected_labels,
+    ) = _build_subfigure_ref_mapping(
+        document_root=document_root,
+        labels=subfigure_candidate_labels,
+        existing_bookmarks=existing_bookmarks,
+        bookmark_id_seed=next_bookmark_id,
+    )
+    next_bookmark_id += subfigure_marker_bookmark_added
+
     figure_anchor_name_all = {
         anchor_name
-        for label in inventory.figure_labels
+        for label in figure_anchor_labels
         for anchor_name in _candidate_anchor_names(label)
     }
     table_anchor_name_all = {
@@ -991,6 +1520,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     figure_ref_mapping, figure_num_bookmark_added, figure_labels_bound, figure_labels_missing_num = (
         _build_caption_ref_bookmark_mapping(
             label_pairs=figure_label_pairs,
+            label_aliases_by_primary=figure_aliases_by_primary,
             existing_bookmarks=existing_bookmarks,
             bookmark_id_seed=next_bookmark_id,
             seq_name="Figure",
@@ -1001,6 +1531,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     table_ref_mapping, table_num_bookmark_added, table_labels_bound, table_labels_missing_num = (
         _build_caption_ref_bookmark_mapping(
             label_pairs=table_label_pairs,
+            label_aliases_by_primary=None,
             existing_bookmarks=existing_bookmarks,
             bookmark_id_seed=next_bookmark_id,
             seq_name="Table",
@@ -1011,6 +1542,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     equation_ref_mapping, equation_num_bookmark_added, equation_labels_bound, equation_labels_missing_num = (
         _build_caption_ref_bookmark_mapping(
             label_pairs=equation_label_pairs,
+            label_aliases_by_primary=None,
             existing_bookmarks=existing_bookmarks,
             bookmark_id_seed=next_bookmark_id,
             seq_name="Eq",
@@ -1019,9 +1551,20 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += equation_num_bookmark_added
 
+    subfigure_anchor_name_all = {
+        anchor_name
+        for label in subfigure_detected_labels
+        for anchor_name in _candidate_anchor_names(label)
+    }
+    subfigure_hyperlink_anchors_in_doc = anchors & subfigure_anchor_name_all
     figure_hyperlink_anchors_in_doc = anchors & figure_anchor_name_all
     table_hyperlink_anchors_in_doc = anchors & table_anchor_name_all
     equation_hyperlink_anchors_in_doc = anchors & equation_anchor_name_all
+    subfigure_anchor_unmapped = sorted(
+        anchor_name
+        for anchor_name in subfigure_hyperlink_anchors_in_doc
+        if anchor_name not in subfigure_ref_mapping
+    )
     figure_anchor_unmapped = sorted(
         anchor_name for anchor_name in figure_hyperlink_anchors_in_doc if anchor_name not in figure_ref_mapping
     )
@@ -1030,6 +1573,13 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     equation_anchor_unmapped = sorted(
         anchor_name for anchor_name in equation_hyperlink_anchors_in_doc if anchor_name not in equation_ref_mapping
+    )
+    subfigure_ref_converted, subfigure_ref_candidate_links, subfigure_ref_candidate_anchor_count = (
+        _convert_hyperlinks_to_ref_fields(
+            document_root,
+            anchor_to_number_bookmark=subfigure_ref_mapping,
+            anchor_display_text=subfigure_ref_display_text,
+        )
     )
     figure_ref_converted, figure_ref_candidate_links, figure_ref_candidate_anchor_count = (
         _convert_hyperlinks_to_ref_fields(
@@ -1050,6 +1600,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         )
     )
 
+    resolved_anchor_names = (
+        set(subfigure_ref_mapping)
+        | set(figure_ref_mapping)
+        | set(table_ref_mapping)
+        | set(equation_ref_mapping)
+    )
+    missing_anchors.difference_update(resolved_anchor_names)
+
     caption_candidates = [
         (paragraph, _paragraph_text(paragraph).strip())
         for paragraph in (figure_caption_paragraphs + table_caption_paragraphs)
@@ -1064,7 +1622,8 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     next_bookmark_id += bookmark_added_fuzzy
 
     bookmark_added_total = (
-        bookmark_added_figure
+        subfigure_marker_bookmark_added
+        + bookmark_added_figure
         + bookmark_added_table
         + bookmark_added_equation
         + bookmark_added_fuzzy
@@ -1078,9 +1637,11 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             equation_prefix_tab_added,
             equation_number_tab_layout_fixed,
             bookmark_added_total,
+            subfigure_marker_bookmark_added,
             figure_num_bookmark_added,
             table_num_bookmark_added,
             equation_num_bookmark_added,
+            subfigure_ref_converted,
             figure_ref_converted,
             table_ref_converted,
             equation_ref_converted,
@@ -1091,9 +1652,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_caption_para_count": len(figure_caption_paragraphs),
         "table_caption_para_count": len(table_caption_paragraphs),
         "display_equation_para_count": len(display_equation_paragraphs),
-        "figure_label_count_from_tex": len(inventory.figure_labels),
+        "figure_label_count_from_tex": len(inventory.figure_all_labels),
+        "figure_label_primary_count_from_tex": len(inventory.figure_labels),
         "table_label_count_from_tex": len(inventory.table_labels),
         "equation_label_count_from_tex": len(inventory.equation_labels),
+        "figure_label_pair_count": len(figure_label_pairs),
+        "table_label_pair_count": len(table_label_pairs),
+        "figure_labels_skipped_by_alignment_count": len(figure_labels_skipped_by_alignment),
+        "table_labels_skipped_by_alignment_count": len(table_labels_skipped_by_alignment),
         "figure_caption_seq_added": figure_seq_added,
         "table_caption_seq_added": table_seq_added,
         "equation_seq_added": equation_seq_added,
@@ -1102,6 +1668,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "equation_style_applied_count": equation_style_applied,
         "equation_style_candidate_count": len(display_equation_paragraphs),
         "bookmark_added_total": bookmark_added_total,
+        "subfigure_marker_bookmark_added": subfigure_marker_bookmark_added,
         "bookmark_added_figure": bookmark_added_figure,
         "bookmark_added_table": bookmark_added_table,
         "bookmark_added_equation": bookmark_added_equation,
@@ -1114,6 +1681,12 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_ref_candidate_anchor_count": figure_ref_candidate_anchor_count,
         "figure_ref_converted_link_count": figure_ref_converted,
         "figure_ref_unmapped_anchor_count": len(figure_anchor_unmapped),
+        "subfigure_ref_mapping_anchor_count": len(subfigure_ref_mapping),
+        "subfigure_detected_label_count": len(subfigure_detected_labels),
+        "subfigure_ref_candidate_link_count": subfigure_ref_candidate_links,
+        "subfigure_ref_candidate_anchor_count": subfigure_ref_candidate_anchor_count,
+        "subfigure_ref_converted_link_count": subfigure_ref_converted,
+        "subfigure_ref_unmapped_anchor_count": len(subfigure_anchor_unmapped),
         "table_ref_mapping_anchor_count": len(table_ref_mapping),
         "table_ref_candidate_link_count": table_ref_candidate_links,
         "table_ref_candidate_anchor_count": table_ref_candidate_anchor_count,
@@ -1134,11 +1707,26 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "equation_display_style_id": displayed_formula_style_id,
         "figure_labels_bound_to_ref_bookmark": figure_labels_bound,
         "figure_labels_missing_number_bookmark": figure_labels_missing_num,
+        "subfigure_labels_bound_to_marker_bookmark": subfigure_labels_bound,
+        "subfigure_labels_missing_marker_bookmark": subfigure_labels_missing_marker[:50],
+        "subfigure_detected_labels": subfigure_detected_labels[:50],
+        "figure_label_alias_count": len(inventory.figure_label_alias_to_primary),
+        "figure_primary_with_alias_count": sum(
+            1 for labels in figure_aliases_by_primary.values() if len(labels) > 1
+        ),
+        "figure_labels_skipped_by_alignment": figure_labels_skipped_by_alignment[:50],
+        "table_labels_skipped_by_alignment": table_labels_skipped_by_alignment[:50],
+        "figure_alias_suggestions_applied": {
+            alias: primary
+            for alias, primary in figure_alias_suggestions.items()
+            if primary in paired_figure_labels
+        },
         "table_labels_bound_to_ref_bookmark": table_labels_bound,
         "table_labels_missing_number_bookmark": table_labels_missing_num,
         "equation_labels_bound_to_ref_bookmark": equation_labels_bound,
         "equation_labels_missing_number_bookmark": equation_labels_missing_num,
         "figure_ref_unmapped_anchors": figure_anchor_unmapped[:50],
+        "subfigure_ref_unmapped_anchors": subfigure_anchor_unmapped[:50],
         "table_ref_unmapped_anchors": table_anchor_unmapped[:50],
         "equation_ref_unmapped_anchors": equation_anchor_unmapped[:50],
         "fuzzy_anchor_repairs": fuzzy_records,
@@ -1149,9 +1737,17 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "figure 标签数量大于 docx 可识别图题段落数量，部分 figure 书签无法自动修复。"
         )
+    if figure_labels_skipped_by_alignment:
+        warnings.append(
+            f"figure 标签-题注对齐中跳过 {len(figure_labels_skipped_by_alignment)} 个标签（疑似子图或被 Pandoc 合并的子题注）。"
+        )
     if len(inventory.table_labels) > len(table_caption_paragraphs):
         warnings.append(
             "table 标签数量大于 docx 可识别表题段落数量，部分 table 书签无法自动修复。"
+        )
+    if table_labels_skipped_by_alignment:
+        warnings.append(
+            f"table 标签-题注对齐中跳过 {len(table_labels_skipped_by_alignment)} 个标签（疑似被 Pandoc 合并或丢失题注）。"
         )
     if len(inventory.equation_labels) > len(display_equation_paragraphs):
         warnings.append(
@@ -1165,6 +1761,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             f"{len(figure_labels_missing_num)} 个 figure 标签未能绑定图号书签，相关图引用无法升级为 REF 字段。"
         )
+    if subfigure_labels_missing_marker:
+        warnings.append(
+            f"{len(subfigure_labels_missing_marker)} 个子图标签未能绑定子图标记书签，相关 \\subref 可能无法升级为子图级 REF。"
+        )
     if table_labels_missing_num:
         warnings.append(
             f"{len(table_labels_missing_num)} 个 table 标签未能绑定表号书签，相关表引用无法升级为 REF 字段。"
@@ -1177,6 +1777,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "部分 figure 超链接未成功转换为 REF 字段，请人工核对图引用。"
         )
+    if subfigure_ref_candidate_links > 0 and subfigure_ref_converted < subfigure_ref_candidate_links:
+        warnings.append(
+            "部分子图超链接未成功转换为子图级 REF 字段，请人工核对子图引用。"
+        )
     if table_ref_candidate_links > 0 and table_ref_converted < table_ref_candidate_links:
         warnings.append(
             "部分 table 超链接未成功转换为 REF 字段，请人工核对表引用。"
@@ -1188,6 +1792,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     if figure_anchor_unmapped:
         warnings.append(
             f"检测到 {len(figure_anchor_unmapped)} 个 figure 风格锚点未映射到图题，已保留原超链接。"
+        )
+    if subfigure_anchor_unmapped:
+        warnings.append(
+            f"检测到 {len(subfigure_anchor_unmapped)} 个子图锚点未映射到子图标记，已保留原超链接。"
         )
     if table_anchor_unmapped:
         warnings.append(

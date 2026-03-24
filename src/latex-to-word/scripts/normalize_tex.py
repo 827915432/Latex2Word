@@ -965,6 +965,7 @@ def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str
     当前实现：
     - \\autoref{label} -> \\ref{label}
     - \\cref{a,b} / \\Cref{a,b} -> \\ref{a}, \\ref{b}
+    - \\subref{label} / \\subref*{label} -> \\ref{label}
 
     为什么这样做：
     - Pandoc 对 LaTeX 内部扩展交叉引用并不总能稳定保持；
@@ -975,6 +976,7 @@ def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str
 
     autoref_pattern = re.compile(r"\\autoref\{([^}]+)\}")
     cref_pattern = re.compile(r"\\(cref|Cref)\{([^}]+)\}")
+    subref_pattern = re.compile(r"\\subref\*?(?:\[[^\]]*\])?\{([^}]+)\}")
 
     def autoref_repl(match: re.Match) -> str:
         label = match.group(1).strip()
@@ -1010,9 +1012,205 @@ def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str
         )
         return ", ".join(f"\\ref{{{label}}}" for label in labels)
 
+    def subref_repl(match: re.Match) -> str:
+        label = match.group(1).strip()
+        line_no = line_number_from_offset(text, match.start())
+        actions.append(
+            ActionRecord(
+                action_type="normalize_subref",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将 \\subref 保守降级为 \\ref（子图引用后续由 DOCX 后处理升级）。",
+                details={"label": label},
+            )
+        )
+        return f"\\ref{{{label}}}"
+
     text = autoref_pattern.sub(autoref_repl, text)
     text = cref_pattern.sub(cref_repl, text)
+    text = subref_pattern.sub(subref_repl, text)
     return text, actions
+
+
+def downgrade_subfloat_wrappers(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    在 figure 环境内将 ``\\subfloat`` / ``\\subfigure`` 保守降级为稳定 minipage 结构。
+
+    背景：
+    - Pandoc 对 ``\\subfloat{...}`` 解析不稳定，常见现象是子图整体丢失，仅保留总图题；
+    - 为提升 Word 端可读性与可维护性，需要在降级时保留子图题注信息。
+
+    处理策略：
+    - 仅在 ``figure / figure*`` 环境内识别 ``\\subfloat`` / ``\\subfigure``；
+    - 解析最多两个可选参数 ``[...]`` 与必须参数 ``{...}``；
+    - 将每个子图转换为：
+      ``minipage(图片主体 + 子题注行)``，形成“图在上、题注在下”的稳定结构；
+    - 子图 ``\\label`` 保持在主体中，不改写标签文本。
+    """
+    actions: list[ActionRecord] = []
+    figure_pattern = re.compile(
+        r"\\begin\{(?P<env>figure\*?)\}(?P<body>.*?)\\end\{(?P=env)\}",
+        re.DOTALL,
+    )
+    subfloat_pattern = re.compile(r"\\(subfloat|subfigure)(?![A-Za-z@])")
+    letters = "abcdefghijklmnopqrstuvwxyz"
+
+    def marker_for_index(index: int) -> str:
+        if index < 0:
+            return "(?)"
+        if index < len(letters):
+            return f"({letters[index]})"
+        # 26 以后使用 aa/ab/... 形式，确保索引稳定。
+        value = index
+        chars: list[str] = []
+        while True:
+            chars.append(letters[value % 26])
+            value = value // 26 - 1
+            if value < 0:
+                break
+        return f"({''.join(reversed(chars))})"
+
+    def width_for_count(count: int) -> str:
+        if count <= 1:
+            return "0.96\\linewidth"
+        if count == 2:
+            return "0.48\\linewidth"
+        if count == 3:
+            return "0.31\\linewidth"
+        width = max(0.18, min(0.48, 0.96 / max(count, 1)))
+        return f"{width:.2f}\\linewidth"
+
+    def choose_subcaption(optionals: list[str]) -> str:
+        if len(optionals) >= 2 and optionals[1].strip():
+            return optionals[1].strip()
+        if optionals and optionals[0].strip():
+            return optionals[0].strip()
+        return ""
+
+    def render_subfloat_minipage(
+        *,
+        body_content: str,
+        marker: str,
+        subcaption: str,
+        width: str,
+    ) -> str:
+        lines: list[str] = [
+            f"\\begin{{minipage}}[t]{{{width}}}",
+            "\\centering",
+            body_content.strip(),
+        ]
+        if subcaption:
+            lines.extend(
+                [
+                    "\\par\\smallskip",
+                    f"\\footnotesize {marker} {subcaption}",
+                ]
+            )
+        lines.append("\\end{minipage}")
+        return "\n".join(lines)
+
+    def parse_subfloat_records(body: str) -> list[dict]:
+        records: list[dict] = []
+        cursor = 0
+        while True:
+            match = subfloat_pattern.search(body, cursor)
+            if not match:
+                break
+
+            command_name = match.group(1)
+            cmd_start = match.start()
+            pos = skip_whitespace(body, match.end())
+
+            optionals: list[str] = []
+            parse_ok = True
+            for _ in range(2):
+                pos = skip_whitespace(body, pos)
+                if pos < len(body) and body[pos] == "[":
+                    opt_end = parse_balanced_group(body, pos, "[", "]")
+                    if opt_end is None:
+                        parse_ok = False
+                        break
+                    optionals.append(body[pos + 1 : opt_end - 1])
+                    pos = opt_end
+                else:
+                    break
+
+            if not parse_ok:
+                cursor = match.end()
+                continue
+
+            pos = skip_whitespace(body, pos)
+            if pos >= len(body) or body[pos] != "{":
+                cursor = match.end()
+                continue
+
+            body_end = parse_balanced_group(body, pos, "{", "}")
+            if body_end is None:
+                cursor = match.end()
+                continue
+
+            records.append(
+                {
+                    "command": command_name,
+                    "start": cmd_start,
+                    "end": body_end,
+                    "optionals": optionals,
+                    "content": body[pos + 1 : body_end - 1],
+                }
+            )
+            cursor = body_end
+        return records
+
+    def repl(match: re.Match) -> str:
+        nonlocal actions
+        env_name = match.group("env")
+        body = match.group("body")
+        records = parse_subfloat_records(body)
+        if not records:
+            return match.group(0)
+
+        width = width_for_count(len(records))
+        chunks: list[str] = []
+        cursor = 0
+        for index, record in enumerate(records):
+            marker = marker_for_index(index)
+            subcaption = choose_subcaption(record["optionals"])
+            replacement = render_subfloat_minipage(
+                body_content=record["content"],
+                marker=marker,
+                subcaption=subcaption,
+                width=width,
+            )
+
+            chunks.append(body[cursor : record["start"]])
+            chunks.append(replacement)
+            cursor = record["end"]
+
+            line_no = line_number_from_offset(text, match.start() + record["start"])
+            actions.append(
+                ActionRecord(
+                    action_type="downgrade_subfloat_wrapper",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="将子图命令降级为 minipage（保留子图题注）以避免 Pandoc 丢图/丢子题注。",
+                    details={
+                        "environment": env_name,
+                        "command": record["command"],
+                        "subcaption_preserved": bool(subcaption),
+                        "subcaption_marker": marker,
+                        "subfloat_count_in_figure": len(records),
+                    },
+                )
+            )
+
+        chunks.append(body[cursor:])
+        new_body = "".join(chunks)
+        return f"\\begin{{{env_name}}}{new_body}\\end{{{env_name}}}"
+
+    new_text = figure_pattern.sub(repl, text)
+    return new_text, actions
 
 
 def find_first_command_span(text: str, command_name: str) -> Optional[tuple[int, int]]:
@@ -1214,8 +1412,9 @@ def process_tex_file(
     2. 补全图片扩展名
     3. 补全 bib 扩展名
     4. 规范化扩展交叉引用
-    5. 调整 float 中 caption / label 顺序
-    6. 展开安全零参数宏
+    5. 降级 subfloat / subfigure 包装
+    6. 调整 float 中 caption / label 顺序
+    7. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -1237,6 +1436,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = normalize_extended_refs(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = downgrade_subfloat_wrappers(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = reorder_label_after_caption_in_floats(text, file_path, work_root)
