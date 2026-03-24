@@ -76,42 +76,36 @@ from pipeline_common import (
     write_json,
     write_markdown,
 )
+from pipeline_constants import (
+    REQUIRED_RULE_FILES,
+    SEVERITY_ERROR,
+    SEVERITY_WARN,
+    STATUS_FAIL,
+    STATUS_PASS,
+    STATUS_PASS_WITH_WARNINGS,
+)
 from pipeline_layout import (
     STAGE_CHECKLIST,
     STAGE_CONVERT,
     STAGE_NORMALIZE,
     STAGE_POSTCHECK,
     STAGE_PRECHECK,
-    best_effort_update_manifest,
     resolve_explicit_or_stage_input,
     resolve_explicit_or_stage_output,
     stage_default_or_legacy,
     stage_dir,
 )
+from stage_reporting import persist_stage_report
 
 
 # -----------------------------------------------------------------------------
 # 常量定义
 # -----------------------------------------------------------------------------
 
-STATUS_PASS = "PASS"
-STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
-STATUS_FAIL = "FAIL"
-
-SEVERITY_INFO = "INFO"
-SEVERITY_WARN = "WARN"
-SEVERITY_ERROR = "ERROR"
-
 DELIVERY_NONE = "none"
 DELIVERY_LOW = "low"
 DELIVERY_MEDIUM = "medium"
 DELIVERY_HIGH = "high"
-
-REQUIRED_RULE_FILES = [
-    "rules/supported_envs.md",
-    "rules/downgrade_policy.md",
-    "rules/acceptance_criteria.md",
-]
 
 
 # -----------------------------------------------------------------------------
@@ -1517,7 +1511,7 @@ def items_from_postcheck(postcheck_report: Optional[dict]) -> list[ChecklistItem
                     why_it_matters="若 docx 本体不可用，则任何人工修复都没有意义，必须先回到转换阶段重新生成可用文档。",
                     recommended_actions=[
                         "先查看 pandoc-conversion.log 和 pandoc-conversion-report.json。",
-                        "修复阻塞问题后重新执行 convert_with_pandoc.sh 和 postcheck_docx.py。",
+                        "修复阻塞问题后重新执行 convert_with_pandoc.py 和 postcheck_docx.py。",
                     ],
                     affects_delivery=DELIVERY_HIGH,
                     details=details,
@@ -1964,9 +1958,6 @@ def main() -> int:
         report.recommendations.append("已按参数 --no-user-view 跳过用户视图目录生成。")
 
     # 回写最终版报告（包含用户视图生成结果）。
-    report_dict = asdict(report)
-    write_json(json_out, report_dict)
-    write_markdown(md_out, render_markdown_report(report))
     top_level_artifacts = {
         "reports": {
             "manual_fix_checklist_json": json_out,
@@ -1976,9 +1967,13 @@ def main() -> int:
     if readme_run_path is not None:
         top_level_artifacts["deliverables"] = {"readme_run": readme_run_path}
 
-    best_effort_update_manifest(
-        work_root,
+    persist_stage_report(
+        work_root=work_root,
         stage=STAGE_CHECKLIST,
+        report_obj=report,
+        markdown_text=render_markdown_report(report),
+        report_json_path=json_out,
+        report_md_path=md_out,
         status=report.status,
         can_continue=report.can_continue,
         artifacts={

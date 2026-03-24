@@ -69,6 +69,7 @@ from typing import Optional
 
 from docx_postprocess import run_docx_postprocess
 from pipeline_common import locate_skill_root, read_text_file, split_csv_payload
+from pipeline_constants import STATUS_FAIL, STATUS_PASS, STATUS_PASS_WITH_WARNINGS
 from pipeline_layout import (
     STAGE_CONVERT,
     STAGE_NORMALIZE,
@@ -79,10 +80,6 @@ from pipeline_layout import (
     stage_dir,
 )
 
-
-STATUS_PASS = "PASS"
-STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
-STATUS_FAIL = "FAIL"
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".bmp", ".tif", ".tiff"]
 RESOURCE_DIR_LIMIT_DEFAULT = 200

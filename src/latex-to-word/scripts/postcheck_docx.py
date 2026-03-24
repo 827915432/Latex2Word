@@ -67,32 +67,33 @@ from pipeline_common import (
     locate_skill_root,
     read_text_file,
     safe_relative,
-    write_json,
-    write_markdown,
+)
+from pipeline_constants import (
+    REQUIRED_RULE_FILES,
+    SEVERITY_ERROR,
+    SEVERITY_INFO,
+    SEVERITY_ORDER,
+    SEVERITY_WARN,
+    STATUS_FAIL,
+    STATUS_PASS,
+    STATUS_PASS_WITH_WARNINGS,
 )
 from pipeline_layout import (
     STAGE_CONVERT,
     STAGE_NORMALIZE,
     STAGE_POSTCHECK,
     STAGE_PRECHECK,
-    best_effort_update_manifest,
     resolve_explicit_or_stage_input,
     resolve_explicit_or_stage_output,
     stage_dir,
 )
+from stage_reporting import persist_stage_report
+from tex_scan_common import strip_latex_comments
 
 
 # -----------------------------------------------------------------------------
 # 常量定义
 # -----------------------------------------------------------------------------
-
-STATUS_PASS = "PASS"
-STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
-STATUS_FAIL = "FAIL"
-
-SEVERITY_INFO = "INFO"
-SEVERITY_WARN = "WARN"
-SEVERITY_ERROR = "ERROR"
 
 # WordprocessingML / OMML / DrawingML 相关命名空间。
 NS = {
@@ -102,14 +103,6 @@ NS = {
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "v": "urn:schemas-microsoft-com:vml",
 }
-
-# 规则文件存在性检查；本脚本不解析规则内容，但会尽早暴露 skill 目录不完整的问题。
-REQUIRED_RULE_FILES = [
-    "rules/supported_envs.md",
-    "rules/downgrade_policy.md",
-    "rules/acceptance_criteria.md",
-]
-
 
 # -----------------------------------------------------------------------------
 # 数据结构定义
@@ -224,33 +217,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="后检查 Markdown 报告输出路径；默认 <work-root>/stage_postcheck/postcheck-report.md",
     )
     return parser
-
-
-def strip_latex_comments(text: str) -> str:
-    """
-    去除 LaTeX 注释，同时尽量保留原始行号结构。
-
-    说明：
-    - 这是源文档侧的粗略统计工具；
-    - 对预期计数用途足够，不试图成为完整 TeX 词法分析器。
-    """
-    stripped_lines: list[str] = []
-    for line in text.splitlines():
-        cut_index = None
-        escaped = False
-        for idx, ch in enumerate(line):
-            if ch == "\\":
-                escaped = not escaped
-                continue
-            if ch == "%" and not escaped:
-                cut_index = idx
-                break
-            escaped = False
-        if cut_index is not None:
-            stripped_lines.append(line[:cut_index])
-        else:
-            stripped_lines.append(line)
-    return "\n".join(stripped_lines)
 
 
 def check_rule_files(skill_root: Path) -> list[Finding]:
@@ -1532,7 +1498,7 @@ def render_markdown_report(report: PostcheckReport) -> str:
         for finding in report.findings:
             grouped[finding["severity"]].append(finding)
 
-        for severity in [SEVERITY_ERROR, SEVERITY_WARN, SEVERITY_INFO]:
+        for severity in SEVERITY_ORDER:
             if severity not in grouped:
                 continue
             lines.append(f"### {severity}")
@@ -1702,12 +1668,13 @@ def main() -> int:
     )
 
     # 写出报告。
-    report_dict = asdict(report)
-    write_json(json_out, report_dict)
-    write_markdown(md_out, render_markdown_report(report))
-    best_effort_update_manifest(
-        work_root,
+    persist_stage_report(
+        work_root=work_root,
         stage=STAGE_POSTCHECK,
+        report_obj=report,
+        markdown_text=render_markdown_report(report),
+        report_json_path=json_out,
+        report_md_path=md_out,
         status=report.status,
         can_continue=report.can_continue,
         artifacts={

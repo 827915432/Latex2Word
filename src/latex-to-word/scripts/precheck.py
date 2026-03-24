@@ -67,22 +67,35 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from pipeline_common import (
     locate_skill_root,
     read_text_file,
     safe_relative,
     split_csv_payload,
-    write_json,
-    write_markdown,
+)
+from pipeline_constants import (
+    REQUIRED_RULE_FILES,
+    SEVERITY_ERROR,
+    SEVERITY_INFO,
+    SEVERITY_ORDER,
+    SEVERITY_WARN,
+    STATUS_FAIL,
+    STATUS_PASS,
+    STATUS_PASS_WITH_WARNINGS,
 )
 from pipeline_layout import (
     STAGE_PRECHECK,
-    best_effort_update_manifest,
     default_work_root_for_project,
     resolve_explicit_or_default,
     resolve_explicit_or_stage_output,
+)
+from stage_reporting import persist_stage_report
+from tex_scan_common import (
+    line_number_from_offset,
+    resolve_path_with_extensions,
+    strip_latex_comments,
 )
 
 
@@ -99,16 +112,6 @@ TEX_EXTENSIONS = [".tex"]
 
 # 支持自动补全的 bibliography 扩展名。
 BIB_EXTENSIONS = [".bib"]
-
-# 预检查阶段使用的 finding 级别。
-SEVERITY_INFO = "INFO"
-SEVERITY_WARN = "WARN"
-SEVERITY_ERROR = "ERROR"
-
-# 最终总体状态。
-STATUS_PASS = "PASS"
-STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
-STATUS_FAIL = "FAIL"
 
 # 在 supported_envs.md 中可视为常见且预期出现的环境。
 # 该集合的目的不是覆盖全部 LaTeX 环境，而是减少明显噪声。
@@ -227,15 +230,6 @@ REF_COMMANDS = (
 # 条件编译命令前缀；若存在，说明工程可能依赖构建上下文。
 CONDITIONAL_PREFIXES = ("if", "ifx", "ifdefined", "ifnum", "ifdim", "ifodd", "ifmmode")
 
-# 规则文件。预检查脚本并不解析规则语义，但会检查这些文件是否存在，
-# 以便尽早暴露 skill 目录结构损坏的问题。
-REQUIRED_RULE_FILES = [
-    "rules/supported_envs.md",
-    "rules/downgrade_policy.md",
-    "rules/acceptance_criteria.md",
-]
-
-
 # -----------------------------------------------------------------------------
 # 数据结构定义
 # -----------------------------------------------------------------------------
@@ -349,80 +343,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Markdown 报告输出路径；默认输出到 <work-root>/stage_precheck/precheck-report.md",
     )
     return parser
-
-
-def strip_latex_comments(text: str) -> str:
-    """
-    移除 LaTeX 注释，同时尽量保留原始行号结构。
-
-    实现策略：
-    - 按行处理；
-    - 删除未被反斜杠转义的 '%' 之后的内容；
-    - 保留换行符数量，便于后续 match 偏移映射回近似行号。
-
-    注意：
-    - 该实现是工程预检查级别的近似处理，不是完整的 TeX 词法分析器；
-    - 对 verbatim / minted 一类环境中的 '%'，理论上不应视为注释；
-      但在预检查阶段，这种近似通常足够且可接受。
-    """
-    stripped_lines: list[str] = []
-    for line in text.splitlines():
-        cut_index = None
-        escaped = False
-        for idx, ch in enumerate(line):
-            if ch == "\\":
-                escaped = not escaped
-                continue
-            if ch == "%" and not escaped:
-                cut_index = idx
-                break
-            escaped = False
-        if cut_index is not None:
-            stripped_lines.append(line[:cut_index])
-        else:
-            stripped_lines.append(line)
-    return "\n".join(stripped_lines)
-
-
-def line_number_from_offset(text: str, offset: int) -> int:
-    """
-    根据字符偏移估算所在行号，行号从 1 开始。
-
-    这里无需实现列号，因为当前 skill 的后续脚本主要只需要行级定位。
-    """
-    return text.count("\n", 0, offset) + 1
-
-
-def resolve_path_with_extensions(base_dir: Path, target: str, extensions: Iterable[str]) -> Optional[Path]:
-    """
-    在给定目录下尝试解析资源路径。
-
-    解析逻辑：
-    1. 若 target 自带后缀，则直接检查该路径；
-    2. 若 target 无后缀，则依次尝试附加给定扩展名；
-    3. 若 target 已是可存在路径，则返回其 resolve 后结果；
-    4. 若全部失败，返回 None。
-
-    说明：
-    - 这里不做额外目录搜索，不跨目录猜测；
-    - 解析应尽量与 LaTeX 的“相对当前文件目录”习惯一致。
-    """
-    target_path = Path(target)
-
-    # 情况 1：用户已显式写出扩展名。
-    if target_path.suffix:
-        candidate = (base_dir / target_path).resolve()
-        return candidate if candidate.exists() else None
-
-    # 情况 2：无扩展名，按约定扩展补全。
-    for ext in extensions:
-        candidate = (base_dir / f"{target}{ext}").resolve()
-        if candidate.exists():
-            return candidate
-
-    # 情况 3：某些文件名本身可能是目录 / 特殊写法；这里仅做最后一次直接检查。
-    candidate = (base_dir / target_path).resolve()
-    return candidate if candidate.exists() else None
 
 
 def detect_main_tex(project_root: Path) -> tuple[Optional[Path], list[Finding]]:
@@ -813,7 +733,7 @@ def render_markdown_report(report: PrecheckReport) -> str:
         for finding in report.findings:
             grouped[finding["severity"]].append(finding)
 
-        for severity in [SEVERITY_ERROR, SEVERITY_WARN, SEVERITY_INFO]:
+        for severity in SEVERITY_ORDER:
             if severity not in grouped:
                 continue
             lines.append(f"### {severity}")
@@ -1533,11 +1453,13 @@ def main() -> int:
                 "显式指定 --main-tex，或修复工程目录中的 .tex 入口文件组织。"
             ],
         )
-        write_json(json_out, asdict(report))
-        write_markdown(md_out, render_markdown_report(report))
-        best_effort_update_manifest(
-            work_root,
+        persist_stage_report(
+            work_root=work_root,
             stage=STAGE_PRECHECK,
+            report_obj=report,
+            markdown_text=render_markdown_report(report),
+            report_json_path=json_out,
+            report_md_path=md_out,
             status=report.status,
             can_continue=report.can_continue,
             artifacts={
@@ -1573,12 +1495,13 @@ def main() -> int:
     )
 
     # 写出报告
-    report_dict = asdict(report)
-    write_json(json_out, report_dict)
-    write_markdown(md_out, render_markdown_report(report))
-    best_effort_update_manifest(
-        work_root,
+    persist_stage_report(
+        work_root=work_root,
         stage=STAGE_PRECHECK,
+        report_obj=report,
+        markdown_text=render_markdown_report(report),
+        report_json_path=json_out,
+        report_md_path=md_out,
         status=report.status,
         can_continue=report.can_continue,
         artifacts={

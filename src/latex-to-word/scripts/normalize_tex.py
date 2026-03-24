@@ -89,28 +89,36 @@ from pipeline_common import (
     write_json,
     write_text_file,
 )
+from pipeline_constants import (
+    REQUIRED_RULE_FILES,
+    SEVERITY_ERROR,
+    SEVERITY_INFO,
+    SEVERITY_ORDER,
+    SEVERITY_WARN,
+    STATUS_FAIL,
+    STATUS_PASS,
+    STATUS_PASS_WITH_WARNINGS,
+)
 from pipeline_layout import (
     STAGE_NORMALIZE,
     STAGE_PRECHECK,
-    best_effort_update_manifest,
     default_work_root_for_project,
     resolve_explicit_or_default,
     resolve_explicit_or_stage_input,
     stage_dir,
+)
+from stage_reporting import persist_stage_report
+from tex_scan_common import (
+    line_number_from_offset,
+    parse_balanced_group,
+    resolve_path_with_extensions,
+    skip_whitespace,
 )
 
 
 # -----------------------------------------------------------------------------
 # 常量定义
 # -----------------------------------------------------------------------------
-
-STATUS_PASS = "PASS"
-STATUS_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
-STATUS_FAIL = "FAIL"
-
-SEVERITY_INFO = "INFO"
-SEVERITY_WARN = "WARN"
-SEVERITY_ERROR = "ERROR"
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".bmp", ".tif", ".tiff"]
 BIB_EXTENSIONS = [".bib"]
@@ -126,14 +134,6 @@ DEFAULT_COPY_IGNORE_NAMES = {
     ".mypy_cache",
     ".DS_Store",
 }
-
-# 规则文件存在性检查；normalize 阶段不解析其内容，但需要尽早发现 skill 目录不完整。
-REQUIRED_RULE_FILES = [
-    "rules/supported_envs.md",
-    "rules/downgrade_policy.md",
-    "rules/acceptance_criteria.md",
-]
-
 
 # -----------------------------------------------------------------------------
 # 数据结构定义
@@ -260,84 +260,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="若工作目录已存在，则先删除再重建。默认不覆盖。",
     )
     return parser
-
-
-def line_number_from_offset(text: str, offset: int) -> int:
-    """
-    根据字符偏移估算行号，行号从 1 开始。
-    """
-    return text.count("\n", 0, offset) + 1
-
-
-def skip_whitespace(text: str, pos: int) -> int:
-    """
-    跳过从 pos 开始的空白字符，返回新的位置索引。
-    """
-    while pos < len(text) and text[pos].isspace():
-        pos += 1
-    return pos
-
-
-def parse_balanced_group(text: str, start: int, open_char: str, close_char: str) -> Optional[int]:
-    """
-    解析从 start 开始的配对分组，返回“分组结束后一个字符”的位置。
-
-    参数要求：
-    - text[start] 必须等于 open_char
-    - 采用简单栈计数
-    - 对反斜杠转义做最基础处理
-
-    示例：
-    text = "{abc{d}}"
-    start = 0
-    返回值 = len(text)
-
-    注意：
-    这里不是完整 TeX 解析器，但对 caption / label / macro body 这类常见结构足够。
-    """
-    if start >= len(text) or text[start] != open_char:
-        return None
-
-    depth = 0
-    i = start
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\":
-            # 跳过转义后的单个字符，避免误把 \{ 或 \} 当作分组边界。
-            i += 2
-            continue
-        if ch == open_char:
-            depth += 1
-        elif ch == close_char:
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return None
-
-
-def resolve_path_with_extensions(base_dir: Path, target: str, extensions: list[str]) -> Optional[Path]:
-    """
-    在给定目录下解析资源路径。
-
-    规则：
-    1. 若 target 自带后缀，则直接检查；
-    2. 若 target 无后缀，则按 extensions 依次补全；
-    3. 若仍不存在，则返回 None。
-    """
-    target_path = Path(target)
-
-    if target_path.suffix:
-        candidate = (base_dir / target_path).resolve()
-        return candidate if candidate.exists() else None
-
-    for ext in extensions:
-        candidate = (base_dir / f"{target}{ext}").resolve()
-        if candidate.exists():
-            return candidate
-
-    candidate = (base_dir / target_path).resolve()
-    return candidate if candidate.exists() else None
 
 
 def check_rule_files(skill_root: Path) -> list[ActionRecord]:
@@ -1519,7 +1441,7 @@ def render_markdown_report(report: NormalizationReport) -> str:
         for item in report.actions:
             grouped[item["severity"]].append(item)
 
-        for severity in [SEVERITY_ERROR, SEVERITY_WARN, SEVERITY_INFO]:
+        for severity in SEVERITY_ORDER:
             if severity not in grouped:
                 continue
             lines.append(f"### {severity}")
@@ -1546,6 +1468,18 @@ def render_markdown_report(report: NormalizationReport) -> str:
     return "\n".join(lines)
 
 
+def build_action_metrics(action_log: list[ActionRecord]) -> dict:
+    """
+    统一统计 action_log 的严重级别计数，避免在失败分支重复拼装。
+    """
+    return {
+        "action_count": len(action_log),
+        "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
+        "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
+        "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
+    }
+
+
 def persist_normalization_report(
     *,
     work_root: Path,
@@ -1558,9 +1492,6 @@ def persist_normalization_report(
     """
     统一写出 normalize 阶段报告，并更新 stage 级 manifest 状态。
     """
-    write_json(json_out, asdict(report))
-    write_text_file(md_out, render_markdown_report(report))
-
     artifacts = {
         "normalization_report_json": json_out,
         "normalization_report_md": md_out,
@@ -1570,9 +1501,13 @@ def persist_normalization_report(
     if normalized_main_tex is not None:
         artifacts["normalized_main_tex"] = normalized_main_tex
 
-    best_effort_update_manifest(
-        work_root,
+    persist_stage_report(
+        work_root=work_root,
         stage=STAGE_NORMALIZE,
+        report_obj=report,
+        markdown_text=render_markdown_report(report),
+        report_json_path=json_out,
+        report_md_path=md_out,
         status=report.status,
         can_continue=report.can_continue,
         artifacts=artifacts,
@@ -1667,12 +1602,7 @@ def main() -> int:
             tex_files_modified_count=0,
             actions=[asdict(a) for a in action_log],
             file_summaries=[],
-            metrics={
-                "action_count": len(action_log),
-                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
-                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
-                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
-            },
+            metrics=build_action_metrics(action_log),
             summary={
                 "status": STATUS_FAIL,
                 "reason": "precheck_failed",
@@ -1711,12 +1641,7 @@ def main() -> int:
             tex_files_modified_count=0,
             actions=[asdict(a) for a in action_log],
             file_summaries=[],
-            metrics={
-                "action_count": len(action_log),
-                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
-                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
-                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
-            },
+            metrics=build_action_metrics(action_log),
             summary={"status": STATUS_FAIL, "reason": "main_tex_not_resolved"},
             recommendations=[
                 "显式传入 --main-tex，或先运行 precheck.py 生成 precheck-report.json。"
@@ -1760,12 +1685,7 @@ def main() -> int:
             tex_files_modified_count=0,
             actions=[asdict(a) for a in action_log],
             file_summaries=[],
-            metrics={
-                "action_count": len(action_log),
-                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
-                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
-                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
-            },
+            metrics=build_action_metrics(action_log),
             summary={"status": STATUS_FAIL, "reason": "unsafe_work_root"},
             recommendations=[
                 "将工作目录设置到原始工程目录之外，例如工程同级目录。"
@@ -1821,12 +1741,7 @@ def main() -> int:
                 tex_files_modified_count=0,
                 actions=[asdict(a) for a in action_log],
                 file_summaries=[],
-                metrics={
-                    "action_count": len(action_log),
-                    "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
-                    "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
-                    "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
-                },
+                metrics=build_action_metrics(action_log),
                 summary={"status": STATUS_FAIL, "reason": "normalize_stage_exists"},
                 recommendations=[
                     "使用 --force 允许删除旧的 stage_normalize，或改用新的 --work-root。"
@@ -1911,12 +1826,7 @@ def main() -> int:
             tex_files_modified_count=0,
             actions=[asdict(a) for a in action_log],
             file_summaries=[],
-            metrics={
-                "action_count": len(action_log),
-                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
-                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
-                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
-            },
+            metrics=build_action_metrics(action_log),
             summary={"status": STATUS_FAIL, "reason": "normalized_main_tex_missing"},
             recommendations=[
                 "检查复制后的工作目录结构，确认主文件相对路径是否正确。"
@@ -1963,12 +1873,7 @@ def main() -> int:
             tex_files_modified_count=0,
             actions=[asdict(a) for a in action_log],
             file_summaries=[],
-            metrics={
-                "action_count": len(action_log),
-                "error_count": sum(1 for a in action_log if a.severity == SEVERITY_ERROR),
-                "warn_count": sum(1 for a in action_log if a.severity == SEVERITY_WARN),
-                "info_count": sum(1 for a in action_log if a.severity == SEVERITY_INFO),
-            },
+            metrics=build_action_metrics(action_log),
             summary={"status": STATUS_FAIL, "reason": "no_target_tex_files"},
             recommendations=[
                 "检查 precheck-report.json 中的 scanned_tex_files，或确认工程中确实存在 .tex 文件。"
