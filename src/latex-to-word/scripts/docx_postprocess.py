@@ -7,7 +7,7 @@ docx_postprocess.py
 1. 为图/表题注补充 Word SEQ 字段编号（图 N / 表 N）；
 2. 为带标签的显示公式补充 SEQ 字段编号（(N)）；
 3. 按 TeX 标签顺序补齐缺失书签，尽量修复内部超链接跳转。
-4. 将文内图引用从内部超链接升级为 Word REF 字段（可随编号更新）。
+4. 将文内图/表/公式引用从内部超链接升级为 Word REF 字段（可随编号更新）。
 
 该模块是“best effort”设计：
 - 不修改源 LaTeX；
@@ -236,6 +236,12 @@ def _make_run(text: str) -> ET.Element:
     return run
 
 
+def _make_tab_run() -> ET.Element:
+    run = ET.Element(wqn("r"))
+    ET.SubElement(run, wqn("tab"))
+    return run
+
+
 def _make_seq_field(seq_name: str, display_number: int | None = None) -> ET.Element:
     fld = ET.Element(wqn("fldSimple"))
     fld.set(wqn("instr"), f"SEQ {seq_name} \\* ARABIC")
@@ -264,6 +270,116 @@ def _insert_nodes_after_ppr(paragraph: ET.Element, nodes: list[ET.Element]) -> N
         index += 1
 
 
+def _run_text(run: ET.Element) -> str:
+    if run.tag != wqn("r"):
+        return ""
+    return "".join((node.text or "") for node in run.findall("./w:t", NS))
+
+
+def _run_text_matches_paren(run: ET.Element, paren: str) -> bool:
+    text = _run_text(run)
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    return compact == paren
+
+
+def _set_run_text(run: ET.Element, text: str) -> bool:
+    if run.tag != wqn("r"):
+        return False
+    text_nodes = run.findall("./w:t", NS)
+    if not text_nodes:
+        return False
+    changed = False
+    for idx, node in enumerate(text_nodes):
+        target = text if idx == 0 else ""
+        if (node.text or "") != target:
+            node.text = target
+            changed = True
+        if xmlqn("space") in node.attrib:
+            del node.attrib[xmlqn("space")]
+    return changed
+
+
+def _is_tab_run(run: ET.Element) -> bool:
+    return run.tag == wqn("r") and run.find("./w:tab", NS) is not None
+
+
+def _find_first_math_child_index(paragraph: ET.Element) -> int:
+    for idx, child in enumerate(list(paragraph)):
+        if child.tag in {mqn("oMathPara"), mqn("oMath")}:
+            return idx
+    return -1
+
+
+def _find_eq_seq_child_index(paragraph: ET.Element) -> int:
+    for idx, child in enumerate(list(paragraph)):
+        if child.tag != wqn("fldSimple"):
+            continue
+        instr = (child.get(wqn("instr"), "") or "").upper()
+        if "SEQ EQ" in instr:
+            return idx
+    return -1
+
+
+def _ensure_equation_prefix_tab(paragraph: ET.Element) -> bool:
+    """
+    确保显示公式前有一个制表符（tab）。
+    """
+    math_idx = _find_first_math_child_index(paragraph)
+    if math_idx < 0:
+        return False
+
+    children = list(paragraph)
+    if math_idx > 0 and _is_tab_run(children[math_idx - 1]):
+        return False
+
+    paragraph.insert(math_idx, _make_tab_run())
+    return True
+
+
+def _ensure_equation_number_tab_layout(paragraph: ET.Element) -> bool:
+    """
+    确保编号区布局为：TAB (SEQ Eq)
+    即：tab equ tab (num)
+    """
+    changed = False
+    seq_idx = _find_eq_seq_child_index(paragraph)
+    if seq_idx < 0:
+        return False
+
+    children = list(paragraph)
+
+    # 1) 确保在 SEQ 前有 "(" 运行。
+    paren_idx = seq_idx
+    if seq_idx > 0 and _run_text_matches_paren(children[seq_idx - 1], "("):
+        paren_idx = seq_idx - 1
+        changed = _set_run_text(children[paren_idx], "(") or changed
+    else:
+        paragraph.insert(seq_idx, _make_run("("))
+        changed = True
+        paren_idx = seq_idx
+
+    # 2) 确保 "(" 前有 tab。
+    children = list(paragraph)
+    if paren_idx == 0 or not _is_tab_run(children[paren_idx - 1]):
+        paragraph.insert(paren_idx, _make_tab_run())
+        changed = True
+
+    # 3) 确保 SEQ 后有 ")"。
+    seq_idx = _find_eq_seq_child_index(paragraph)
+    children = list(paragraph)
+    if seq_idx < 0:
+        return changed
+    if seq_idx + 1 < len(children) and _run_text_matches_paren(children[seq_idx + 1], ")"):
+        changed = _set_run_text(children[seq_idx + 1], ")") or changed
+    else:
+        paragraph.insert(seq_idx + 1, _make_run(")"))
+        changed = True
+
+    return changed
+
+
 def _prepend_caption_seq(
     paragraph: ET.Element,
     *,
@@ -289,7 +405,8 @@ def _append_equation_seq(
     text = _paragraph_text(paragraph).strip()
     if re.search(r"\(\d+\)$", text):
         return False
-    paragraph.append(_make_run(" ("))
+    paragraph.append(_make_tab_run())
+    paragraph.append(_make_run("("))
     paragraph.append(_make_seq_field(seq_name, sequence_index))
     paragraph.append(_make_run(")"))
     return True
@@ -334,6 +451,66 @@ def _parse_caption_style_ids(styles_root: ET.Element) -> tuple[set[str], set[str
             generic_caption_style_ids.add(style_id)
 
     return figure_style_ids, table_style_ids, generic_caption_style_ids
+
+
+def _normalize_style_name(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip().lower())
+
+
+def _find_displayed_formula_style_id(styles_root: ET.Element) -> str:
+    """
+    在 styles.xml 中查找“显示公式”段落样式 ID。
+    优先级：
+    1. 样式名匹配 Displayed formula（忽略空白与大小写）；
+    2. styleId 精确等于 Displayedformula / DisplayedFormula（大小写不敏感）。
+    """
+    target_names = {
+        "displayedformula",
+        "displayformula",
+        "公式显示",
+        "显示公式",
+    }
+    fallback_candidates: list[str] = []
+
+    for style in styles_root.findall(".//w:style[@w:type='paragraph']", NS):
+        style_id = (style.get(wqn("styleId"), "") or "").strip()
+        if not style_id:
+            continue
+
+        normalized_style_id = _normalize_style_name(style_id)
+        if normalized_style_id in {"displayedformula", "displayformula"}:
+            fallback_candidates.append(style_id)
+
+        name_node = style.find("./w:name", NS)
+        style_name = ""
+        if name_node is not None:
+            style_name = (name_node.get(wqn("val"), "") or "").strip()
+        normalized_name = _normalize_style_name(style_name)
+        if normalized_name in target_names:
+            return style_id
+
+    if fallback_candidates:
+        return fallback_candidates[0]
+    return ""
+
+
+def _set_paragraph_style_id(paragraph: ET.Element, style_id: str) -> bool:
+    if not style_id:
+        return False
+    ppr = paragraph.find("./w:pPr", NS)
+    if ppr is None:
+        ppr = ET.Element(wqn("pPr"))
+        paragraph.insert(0, ppr)
+
+    style_node = ppr.find("./w:pStyle", NS)
+    if style_node is None:
+        style_node = ET.SubElement(ppr, wqn("pStyle"))
+
+    current = (style_node.get(wqn("val"), "") or "").strip()
+    if current == style_id:
+        return False
+    style_node.set(wqn("val"), style_id)
+    return True
 
 
 def _paragraph_has_visible_payload(paragraph: ET.Element) -> bool:
@@ -396,9 +573,16 @@ def _candidate_anchor_names(label: str) -> list[str]:
     return names
 
 
-def _figure_num_bookmark_name(label: str) -> str:
+def _number_bookmark_name(object_kind: str, label: str) -> str:
     digest = hashlib.sha1(label.strip().encode("utf-8")).hexdigest()[:32]
-    return f"figNum_{digest}"
+    prefix = {
+        "figure": "figNum",
+        "table": "tabNum",
+        "equation": "eqNum",
+    }.get(object_kind, "")
+    if not prefix:
+        return ""
+    return f"{prefix}_{digest}"
 
 
 def _normalize_for_similarity(text: str) -> str:
@@ -498,14 +682,16 @@ def _repair_label_bookmarks(
     return added, touched_labels
 
 
-def _build_figure_ref_bookmark_mapping(
+def _build_caption_ref_bookmark_mapping(
     *,
-    figure_label_pairs: list[tuple[ET.Element, str]],
+    label_pairs: list[tuple[ET.Element, str]],
     existing_bookmarks: set[str],
     bookmark_id_seed: int,
+    seq_name: str,
+    object_kind: str,
 ) -> tuple[dict[str, str], int, int, list[str]]:
     """
-    为 figure 标签创建“图号专用书签”，并输出 anchor -> 书签名映射。
+    为指定对象（figure/table/equation）标签创建“编号专用书签”，并输出 anchor -> 书签名映射。
     """
     next_id = bookmark_id_seed
     added = 0
@@ -513,14 +699,17 @@ def _build_figure_ref_bookmark_mapping(
     labels_missing_seq: list[str] = []
     mapping: dict[str, str] = {}
 
-    for paragraph, label in figure_label_pairs:
+    for paragraph, label in label_pairs:
         label_key = label.strip()
         if not label_key:
             continue
 
-        number_bookmark = _figure_num_bookmark_name(label_key)
+        number_bookmark = _number_bookmark_name(object_kind, label_key)
+        if not number_bookmark:
+            labels_missing_seq.append(label_key)
+            continue
         if number_bookmark not in existing_bookmarks:
-            seq_field = _find_direct_seq_field(paragraph, "Figure")
+            seq_field = _find_direct_seq_field(paragraph, seq_name)
             if seq_field is None:
                 labels_missing_seq.append(label_key)
                 continue
@@ -544,13 +733,13 @@ def _build_figure_ref_bookmark_mapping(
     return mapping, added, labels_bound, labels_missing_seq
 
 
-def _convert_figure_hyperlinks_to_ref_fields(
+def _convert_hyperlinks_to_ref_fields(
     document_root: ET.Element,
     *,
     anchor_to_number_bookmark: dict[str, str],
 ) -> tuple[int, int, int]:
     """
-    将文内 figure 引用从 hyperlink(anchor) 转换为 REF 字段。
+    将文内 hyperlink(anchor) 转换为 REF 字段（仅处理传入映射中的锚点）。
     返回：
     - converted_link_count
     - candidate_link_count
@@ -666,6 +855,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     styles_root = ET.fromstring(payload["word/styles.xml"])
 
     figure_style_ids, table_style_ids, generic_caption_style_ids = _parse_caption_style_ids(styles_root)
+    displayed_formula_style_id = _find_displayed_formula_style_id(styles_root)
 
     body = document_root.find("./w:body", NS)
     if body is None:
@@ -754,10 +944,26 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += bookmark_added_table
 
+    equation_prefix_tab_added = 0
+    for paragraph in display_equation_paragraphs:
+        if _ensure_equation_prefix_tab(paragraph):
+            equation_prefix_tab_added += 1
+
     equation_seq_added = 0
     for index, (paragraph, _label) in enumerate(equation_label_pairs, start=1):
         if _append_equation_seq(paragraph, seq_name="Eq", sequence_index=index):
             equation_seq_added += 1
+
+    equation_number_tab_layout_fixed = 0
+    for paragraph in display_equation_paragraphs:
+        if _ensure_equation_number_tab_layout(paragraph):
+            equation_number_tab_layout_fixed += 1
+
+    equation_style_applied = 0
+    if displayed_formula_style_id:
+        for paragraph in display_equation_paragraphs:
+            if _set_paragraph_style_id(paragraph, displayed_formula_style_id):
+                equation_style_applied += 1
 
     bookmark_added_equation, equation_label_repaired = _repair_label_bookmarks(
         label_pairs=equation_label_pairs,
@@ -772,23 +978,75 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         for label in inventory.figure_labels
         for anchor_name in _candidate_anchor_names(label)
     }
+    table_anchor_name_all = {
+        anchor_name
+        for label in inventory.table_labels
+        for anchor_name in _candidate_anchor_names(label)
+    }
+    equation_anchor_name_all = {
+        anchor_name
+        for label in inventory.equation_labels
+        for anchor_name in _candidate_anchor_names(label)
+    }
     figure_ref_mapping, figure_num_bookmark_added, figure_labels_bound, figure_labels_missing_num = (
-        _build_figure_ref_bookmark_mapping(
-            figure_label_pairs=figure_label_pairs,
+        _build_caption_ref_bookmark_mapping(
+            label_pairs=figure_label_pairs,
             existing_bookmarks=existing_bookmarks,
             bookmark_id_seed=next_bookmark_id,
+            seq_name="Figure",
+            object_kind="figure",
         )
     )
     next_bookmark_id += figure_num_bookmark_added
+    table_ref_mapping, table_num_bookmark_added, table_labels_bound, table_labels_missing_num = (
+        _build_caption_ref_bookmark_mapping(
+            label_pairs=table_label_pairs,
+            existing_bookmarks=existing_bookmarks,
+            bookmark_id_seed=next_bookmark_id,
+            seq_name="Table",
+            object_kind="table",
+        )
+    )
+    next_bookmark_id += table_num_bookmark_added
+    equation_ref_mapping, equation_num_bookmark_added, equation_labels_bound, equation_labels_missing_num = (
+        _build_caption_ref_bookmark_mapping(
+            label_pairs=equation_label_pairs,
+            existing_bookmarks=existing_bookmarks,
+            bookmark_id_seed=next_bookmark_id,
+            seq_name="Eq",
+            object_kind="equation",
+        )
+    )
+    next_bookmark_id += equation_num_bookmark_added
 
     figure_hyperlink_anchors_in_doc = anchors & figure_anchor_name_all
+    table_hyperlink_anchors_in_doc = anchors & table_anchor_name_all
+    equation_hyperlink_anchors_in_doc = anchors & equation_anchor_name_all
     figure_anchor_unmapped = sorted(
         anchor_name for anchor_name in figure_hyperlink_anchors_in_doc if anchor_name not in figure_ref_mapping
     )
+    table_anchor_unmapped = sorted(
+        anchor_name for anchor_name in table_hyperlink_anchors_in_doc if anchor_name not in table_ref_mapping
+    )
+    equation_anchor_unmapped = sorted(
+        anchor_name for anchor_name in equation_hyperlink_anchors_in_doc if anchor_name not in equation_ref_mapping
+    )
     figure_ref_converted, figure_ref_candidate_links, figure_ref_candidate_anchor_count = (
-        _convert_figure_hyperlinks_to_ref_fields(
+        _convert_hyperlinks_to_ref_fields(
             document_root,
             anchor_to_number_bookmark=figure_ref_mapping,
+        )
+    )
+    table_ref_converted, table_ref_candidate_links, table_ref_candidate_anchor_count = (
+        _convert_hyperlinks_to_ref_fields(
+            document_root,
+            anchor_to_number_bookmark=table_ref_mapping,
+        )
+    )
+    equation_ref_converted, equation_ref_candidate_links, equation_ref_candidate_anchor_count = (
+        _convert_hyperlinks_to_ref_fields(
+            document_root,
+            anchor_to_number_bookmark=equation_ref_mapping,
         )
     )
 
@@ -817,7 +1075,15 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             figure_seq_added,
             table_seq_added,
             equation_seq_added,
+            equation_prefix_tab_added,
+            equation_number_tab_layout_fixed,
             bookmark_added_total,
+            figure_num_bookmark_added,
+            table_num_bookmark_added,
+            equation_num_bookmark_added,
+            figure_ref_converted,
+            table_ref_converted,
+            equation_ref_converted,
         )
     )
 
@@ -831,17 +1097,33 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_caption_seq_added": figure_seq_added,
         "table_caption_seq_added": table_seq_added,
         "equation_seq_added": equation_seq_added,
+        "equation_prefix_tab_added": equation_prefix_tab_added,
+        "equation_number_tab_layout_fixed": equation_number_tab_layout_fixed,
+        "equation_style_applied_count": equation_style_applied,
+        "equation_style_candidate_count": len(display_equation_paragraphs),
         "bookmark_added_total": bookmark_added_total,
         "bookmark_added_figure": bookmark_added_figure,
         "bookmark_added_table": bookmark_added_table,
         "bookmark_added_equation": bookmark_added_equation,
         "bookmark_added_fuzzy": bookmark_added_fuzzy,
         "figure_num_bookmark_added": figure_num_bookmark_added,
+        "table_num_bookmark_added": table_num_bookmark_added,
+        "equation_num_bookmark_added": equation_num_bookmark_added,
         "figure_ref_mapping_anchor_count": len(figure_ref_mapping),
         "figure_ref_candidate_link_count": figure_ref_candidate_links,
         "figure_ref_candidate_anchor_count": figure_ref_candidate_anchor_count,
         "figure_ref_converted_link_count": figure_ref_converted,
         "figure_ref_unmapped_anchor_count": len(figure_anchor_unmapped),
+        "table_ref_mapping_anchor_count": len(table_ref_mapping),
+        "table_ref_candidate_link_count": table_ref_candidate_links,
+        "table_ref_candidate_anchor_count": table_ref_candidate_anchor_count,
+        "table_ref_converted_link_count": table_ref_converted,
+        "table_ref_unmapped_anchor_count": len(table_anchor_unmapped),
+        "equation_ref_mapping_anchor_count": len(equation_ref_mapping),
+        "equation_ref_candidate_link_count": equation_ref_candidate_links,
+        "equation_ref_candidate_anchor_count": equation_ref_candidate_anchor_count,
+        "equation_ref_converted_link_count": equation_ref_converted,
+        "equation_ref_unmapped_anchor_count": len(equation_anchor_unmapped),
         "missing_anchor_count_after": len(missing_anchors),
     }
 
@@ -849,9 +1131,16 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_labels_repaired": figure_label_repaired,
         "table_labels_repaired": table_label_repaired,
         "equation_labels_repaired": equation_label_repaired,
+        "equation_display_style_id": displayed_formula_style_id,
         "figure_labels_bound_to_ref_bookmark": figure_labels_bound,
         "figure_labels_missing_number_bookmark": figure_labels_missing_num,
+        "table_labels_bound_to_ref_bookmark": table_labels_bound,
+        "table_labels_missing_number_bookmark": table_labels_missing_num,
+        "equation_labels_bound_to_ref_bookmark": equation_labels_bound,
+        "equation_labels_missing_number_bookmark": equation_labels_missing_num,
         "figure_ref_unmapped_anchors": figure_anchor_unmapped[:50],
+        "table_ref_unmapped_anchors": table_anchor_unmapped[:50],
+        "equation_ref_unmapped_anchors": equation_anchor_unmapped[:50],
         "fuzzy_anchor_repairs": fuzzy_records,
         "missing_anchors_sample_after": sorted(missing_anchors)[:50],
     }
@@ -868,17 +1157,45 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "equation 标签数量大于 docx 可识别显示公式段落数量，部分公式书签无法自动修复。"
         )
+    if display_equation_paragraphs and not displayed_formula_style_id:
+        warnings.append(
+            "未在 reference.docx 中检测到 Displayed formula 样式；显示公式段落保持原样式。"
+        )
     if figure_labels_missing_num:
         warnings.append(
             f"{len(figure_labels_missing_num)} 个 figure 标签未能绑定图号书签，相关图引用无法升级为 REF 字段。"
+        )
+    if table_labels_missing_num:
+        warnings.append(
+            f"{len(table_labels_missing_num)} 个 table 标签未能绑定表号书签，相关表引用无法升级为 REF 字段。"
+        )
+    if equation_labels_missing_num:
+        warnings.append(
+            f"{len(equation_labels_missing_num)} 个 equation 标签未能绑定公式号书签，相关公式引用无法升级为 REF 字段。"
         )
     if figure_ref_candidate_links > 0 and figure_ref_converted < figure_ref_candidate_links:
         warnings.append(
             "部分 figure 超链接未成功转换为 REF 字段，请人工核对图引用。"
         )
+    if table_ref_candidate_links > 0 and table_ref_converted < table_ref_candidate_links:
+        warnings.append(
+            "部分 table 超链接未成功转换为 REF 字段，请人工核对表引用。"
+        )
+    if equation_ref_candidate_links > 0 and equation_ref_converted < equation_ref_candidate_links:
+        warnings.append(
+            "部分 equation 超链接未成功转换为 REF 字段，请人工核对公式引用。"
+        )
     if figure_anchor_unmapped:
         warnings.append(
             f"检测到 {len(figure_anchor_unmapped)} 个 figure 风格锚点未映射到图题，已保留原超链接。"
+        )
+    if table_anchor_unmapped:
+        warnings.append(
+            f"检测到 {len(table_anchor_unmapped)} 个 table 风格锚点未映射到表题，已保留原超链接。"
+        )
+    if equation_anchor_unmapped:
+        warnings.append(
+            f"检测到 {len(equation_anchor_unmapped)} 个 equation 风格锚点未映射到公式编号，已保留原超链接。"
         )
     if missing_anchors:
         warnings.append(
