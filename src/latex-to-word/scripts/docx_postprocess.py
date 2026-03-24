@@ -86,6 +86,8 @@ DISPLAY_EQUATION_ENVS = {
 
 TOKEN_PATTERN = re.compile(r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+)\}")
 LABEL_CMD_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
+ALGORITHM_TITLE_PATTERN = re.compile(r"^\s*(?:algorithm|算法)\s*:", re.IGNORECASE)
+ALGORITHM_IO_PATTERN = re.compile(r"^\s*(?:input|output|输入|输出)\s*:", re.IGNORECASE)
 
 
 @dataclass
@@ -605,6 +607,181 @@ def _paragraph_text(paragraph: ET.Element) -> str:
 
 def _paragraph_contains_drawing(paragraph: ET.Element) -> bool:
     return paragraph.find(".//w:drawing", NS) is not None or paragraph.find(".//w:pict", NS) is not None
+
+
+def _paragraph_has_numbering(paragraph: ET.Element) -> bool:
+    ppr = paragraph.find("./w:pPr", NS)
+    if ppr is None:
+        return False
+    return ppr.find("./w:numPr", NS) is not None
+
+
+def _select_algorithm_table_style_id(styles_root: ET.Element) -> str:
+    """
+    选择算法表格使用的样式（若存在）。
+    """
+    table_style_ids: set[str] = set()
+    for style in styles_root.findall("./w:style", NS):
+        if style.get(wqn("type"), "") != "table":
+            continue
+        style_id = (style.get(wqn("styleId"), "") or "").strip()
+        if style_id:
+            table_style_ids.add(style_id)
+
+    for candidate in ("AlgorithmTable", "Table", "TableGrid", "a3"):
+        if candidate in table_style_ids:
+            return candidate
+
+    return ""
+
+
+def _build_algorithm_table(paragraphs: list[ET.Element], table_style_id: str) -> ET.Element:
+    """
+    将若干段落封装为 1x1 的算法表格。
+    """
+    tbl = ET.Element(wqn("tbl"))
+    tbl_pr = ET.SubElement(tbl, wqn("tblPr"))
+
+    if table_style_id:
+        tbl_style = ET.SubElement(tbl_pr, wqn("tblStyle"))
+        tbl_style.set(wqn("val"), table_style_id)
+
+    tbl_w = ET.SubElement(tbl_pr, wqn("tblW"))
+    tbl_w.set(wqn("w"), "0")
+    tbl_w.set(wqn("type"), "auto")
+
+    tbl_borders = ET.SubElement(tbl_pr, wqn("tblBorders"))
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        border = ET.SubElement(tbl_borders, wqn(side))
+        border.set(wqn("val"), "single")
+        border.set(wqn("sz"), "4")
+        border.set(wqn("space"), "0")
+        border.set(wqn("color"), "auto")
+
+    tbl_cell_mar = ET.SubElement(tbl_pr, wqn("tblCellMar"))
+    for side in ("top", "left", "bottom", "right"):
+        margin = ET.SubElement(tbl_cell_mar, wqn(side))
+        margin.set(wqn("w"), "80")
+        margin.set(wqn("type"), "dxa")
+
+    tbl_grid = ET.SubElement(tbl, wqn("tblGrid"))
+    grid_col = ET.SubElement(tbl_grid, wqn("gridCol"))
+    grid_col.set(wqn("w"), "9000")
+
+    tr = ET.SubElement(tbl, wqn("tr"))
+    tc = ET.SubElement(tr, wqn("tc"))
+    tc_pr = ET.SubElement(tc, wqn("tcPr"))
+    tc_w = ET.SubElement(tc_pr, wqn("tcW"))
+    tc_w.set(wqn("w"), "9000")
+    tc_w.set(wqn("type"), "dxa")
+    tc_valign = ET.SubElement(tc_pr, wqn("vAlign"))
+    tc_valign.set(wqn("val"), "top")
+
+    for paragraph in paragraphs:
+        tc.append(paragraph)
+
+    if not paragraphs:
+        tc.append(ET.Element(wqn("p")))
+
+    return tbl
+
+
+def _wrap_algorithm_blocks_as_tables(
+    *,
+    body: ET.Element,
+    styles_root: ET.Element,
+) -> tuple[int, int, int, int, str, list[dict[str, object]]]:
+    """
+    识别并将算法块封装为表格。
+
+    识别规则（稳定）：
+    - 起始段落文本以 "Algorithm:"（或“算法:”）开头；
+    - 后续可包含 Input/Output 段落；
+    - 必须包含至少 1 个带编号属性（numPr）的步骤段落；
+    - 在遇到不属于上述集合的段落时结束块。
+    """
+    table_style_id = _select_algorithm_table_style_id(styles_root)
+    wrapped_block_count = 0
+    wrapped_paragraph_count = 0
+    detected_block_count = 0
+    skipped_block_count = 0
+    block_samples: list[dict[str, object]] = []
+
+    while True:
+        children = list(body)
+        changed = False
+        index = 0
+
+        while index < len(children):
+            element = children[index]
+            if element.tag != wqn("p"):
+                index += 1
+                continue
+
+            title_text = _paragraph_text(element).strip()
+            if not ALGORITHM_TITLE_PATTERN.match(title_text):
+                index += 1
+                continue
+
+            detected_block_count += 1
+            block: list[ET.Element] = [element]
+            step_count = 0
+            cursor = index + 1
+
+            while cursor < len(children):
+                follower = children[cursor]
+                if follower.tag != wqn("p"):
+                    break
+
+                follower_text = _paragraph_text(follower).strip()
+                if ALGORITHM_IO_PATTERN.match(follower_text):
+                    block.append(follower)
+                    cursor += 1
+                    continue
+
+                if _paragraph_has_numbering(follower):
+                    block.append(follower)
+                    step_count += 1
+                    cursor += 1
+                    continue
+
+                break
+
+            if step_count <= 0:
+                skipped_block_count += 1
+                index += 1
+                continue
+
+            for paragraph in block:
+                body.remove(paragraph)
+
+            table_element = _build_algorithm_table(block, table_style_id)
+            body.insert(index, table_element)
+
+            wrapped_block_count += 1
+            wrapped_paragraph_count += len(block)
+            block_samples.append(
+                {
+                    "start_index": index,
+                    "paragraph_count": len(block),
+                    "step_count": step_count,
+                    "title_text": title_text[:120],
+                }
+            )
+            changed = True
+            break
+
+        if not changed:
+            break
+
+    return (
+        wrapped_block_count,
+        wrapped_paragraph_count,
+        detected_block_count,
+        skipped_block_count,
+        table_style_id,
+        block_samples,
+    )
 
 
 def _paragraph_has_seq_field(paragraph: ET.Element, seq_keyword: str | None = None) -> bool:
@@ -1759,6 +1936,18 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     if body is None:
         raise RuntimeError("document.xml 缺少 w:body。")
 
+    (
+        algorithm_table_wrapped_count,
+        algorithm_table_wrapped_paragraph_count,
+        algorithm_block_detected_count,
+        algorithm_block_skipped_count,
+        algorithm_table_style_id,
+        algorithm_block_samples,
+    ) = _wrap_algorithm_blocks_as_tables(
+        body=body,
+        styles_root=styles_root,
+    )
+
     elements = list(body)
     figure_caption_paragraphs: list[ET.Element] = []
     table_caption_paragraphs: list[ET.Element] = []
@@ -2073,6 +2262,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     modified = any(
         value > 0
         for value in (
+            algorithm_table_wrapped_count,
             figure_seq_added,
             table_seq_added,
             equation_seq_added,
@@ -2091,6 +2281,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
 
     metrics = {
+        "algorithm_block_detected_count": algorithm_block_detected_count,
+        "algorithm_block_wrapped_count": algorithm_table_wrapped_count,
+        "algorithm_block_skipped_count": algorithm_block_skipped_count,
+        "algorithm_paragraph_wrapped_count": algorithm_table_wrapped_paragraph_count,
         "figure_caption_para_count": len(figure_caption_paragraphs),
         "table_caption_para_count": len(table_caption_paragraphs),
         "display_equation_para_count": len(display_equation_paragraphs),
@@ -2154,6 +2348,8 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     }
 
     details = {
+        "algorithm_table_style_id": algorithm_table_style_id,
+        "algorithm_block_samples": algorithm_block_samples[:20],
         "figure_labels_repaired": figure_label_repaired,
         "table_labels_repaired": table_label_repaired,
         "equation_labels_repaired": equation_label_repaired,
@@ -2209,6 +2405,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     if len(inventory.figure_labels) > len(figure_caption_paragraphs):
         warnings.append(
             "figure 标签数量大于 docx 可识别图题段落数量，部分 figure 书签无法自动修复。"
+        )
+    if algorithm_block_skipped_count > 0:
+        warnings.append(
+            f"检测到 {algorithm_block_skipped_count} 个算法标题块未匹配到编号步骤，已保持原段落结构。"
         )
     if figure_labels_skipped_by_pairing:
         warnings.append(
