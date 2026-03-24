@@ -65,6 +65,25 @@ EQUATION_ENVS = {
     "cases",
 }
 
+# 仅用于“显示公式段落槽位”对齐的环境集合。
+# 注意：split/cases 常作为 equation/align 的内部子环境，不对应独立显示段落。
+DISPLAY_EQUATION_ENVS = {
+    "equation",
+    "equation*",
+    "align",
+    "align*",
+    "alignat",
+    "alignat*",
+    "flalign",
+    "flalign*",
+    "gather",
+    "gather*",
+    "multline",
+    "multline*",
+    "eqnarray",
+    "eqnarray*",
+}
+
 TOKEN_PATTERN = re.compile(r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+)\}")
 LABEL_CMD_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
 
@@ -419,6 +438,86 @@ def extract_label_inventory(tex_files: list[Path]) -> LabelInventory:
         table_labels=_dedup_keep_order(table_labels),
         equation_labels=_dedup_keep_order(equation_labels),
     )
+
+
+def extract_equation_display_slots(tex_files: list[Path]) -> list[dict[str, object]]:
+    """
+    提取“显示级公式槽位”列表，并保留每个槽位中的标签集合（可为空）。
+
+    设计目的：
+    - 槽位数应尽量对应 Pandoc 产物中的显示公式段落数；
+    - 槽位内标签用于把编号绑定到正确公式，而不是简单按“标签列表顺序”压到前 N 个公式。
+    """
+    slots: list[dict[str, object]] = []
+
+    for tex_file in tex_files:
+        try:
+            raw = tex_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw = tex_file.read_text(encoding="gbk")
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        text = _strip_comments(raw)
+        stack: list[dict[str, object]] = []
+
+        for match in TOKEN_PATTERN.finditer(text):
+            begin_env = match.group(1)
+            end_env = match.group(2)
+            label = match.group(3)
+
+            if begin_env:
+                stack.append(
+                    {
+                        "env": begin_env.strip().lower(),
+                        "labels": [],
+                    }
+                )
+                continue
+
+            if end_env:
+                env = end_env.strip().lower()
+                if not stack:
+                    continue
+                for pos in range(len(stack) - 1, -1, -1):
+                    item = stack[pos]
+                    if item.get("env") != env:
+                        continue
+                    stack = stack[:pos]
+                    if env in DISPLAY_EQUATION_ENVS:
+                        labels = item.get("labels", [])
+                        if not isinstance(labels, list):
+                            labels = []
+                        slots.append(
+                            {
+                                "env": env,
+                                "labels": _dedup_keep_order(str(v) for v in labels),
+                            }
+                        )
+                    break
+                continue
+
+            if not label:
+                continue
+            label_key = label.strip()
+            if not label_key:
+                continue
+
+            for pos in range(len(stack) - 1, -1, -1):
+                env = str(stack[pos].get("env", ""))
+                if env not in DISPLAY_EQUATION_ENVS:
+                    continue
+                labels = stack[pos].get("labels")
+                if not isinstance(labels, list):
+                    labels = []
+                    stack[pos]["labels"] = labels
+                labels.append(label_key)
+                break
+
+    return slots
 
 
 def _paragraph_style_id(paragraph: ET.Element) -> str:
@@ -1154,6 +1253,84 @@ def _group_aliases_by_primary(
     return grouped
 
 
+def _build_equation_label_pairs_by_slots(
+    *,
+    display_equation_paragraphs: list[ET.Element],
+    equation_slots: list[dict[str, object]],
+    fallback_equation_labels: list[str],
+) -> tuple[list[tuple[ET.Element, str]], dict[str, list[str]], list[ET.Element], str, list[str], int]:
+    """
+    基于 TeX 槽位对齐显示公式段落，生成 equation (paragraph, label) 配对。
+
+    返回：
+    - label_pairs
+    - label_aliases_by_primary
+    - number_targets（需要补 SEQ Eq 的公式段落）
+    - pairing_strategy: slots / fallback_zip
+    - pairing_warnings
+    - unlabeled_equation_numbered_count（由 `equation` 环境触发的无标签编号数量）
+    """
+    warnings: list[str] = []
+
+    if display_equation_paragraphs and equation_slots and len(equation_slots) == len(display_equation_paragraphs):
+        pairs: list[tuple[ET.Element, str]] = []
+        alias_to_primary: dict[str, str] = {}
+        primary_labels: list[str] = []
+        number_targets: list[ET.Element] = []
+        unlabeled_equation_numbered_count = 0
+
+        for paragraph, slot in zip(display_equation_paragraphs, equation_slots):
+            env = str(slot.get("env", "")).strip().lower()
+            raw_labels = slot.get("labels", [])
+            if isinstance(raw_labels, list):
+                dedup_labels = _dedup_keep_order(str(v) for v in raw_labels)
+            else:
+                dedup_labels = []
+
+            # 规则：
+            # 1) 任意带标签的显示公式都编号；
+            # 2) 额外对 \begin{equation}...\end{equation} 的无标签独立公式补编号。
+            should_number = bool(dedup_labels) or env == "equation"
+            if should_number:
+                number_targets.append(paragraph)
+            if env == "equation" and not dedup_labels:
+                unlabeled_equation_numbered_count += 1
+
+            if not dedup_labels:
+                continue
+
+            primary = dedup_labels[0]
+            if primary not in primary_labels:
+                primary_labels.append(primary)
+            pairs.append((paragraph, primary))
+
+            for alias in dedup_labels:
+                _bind_alias(alias_to_primary, alias=alias, primary=primary)
+
+        grouped_aliases = _group_aliases_by_primary(alias_to_primary, primary_labels)
+        return (
+            pairs,
+            grouped_aliases,
+            number_targets,
+            "slots",
+            warnings,
+            unlabeled_equation_numbered_count,
+        )
+
+    warnings.append(
+        "公式槽位数与 docx 显示公式段落数不一致，已回退到顺序配对（fallback_zip）。"
+    )
+    fallback_pairs = list(zip(display_equation_paragraphs, fallback_equation_labels))
+    return (
+        fallback_pairs,
+        {},
+        [paragraph for paragraph, _label in fallback_pairs],
+        "fallback_zip",
+        warnings,
+        0,
+    )
+
+
 def _build_caption_ref_bookmark_mapping(
     *,
     label_pairs: list[tuple[ET.Element, str]],
@@ -1420,7 +1597,20 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             inventory.table_labels,
         )
     )
-    equation_label_pairs = list(zip(display_equation_paragraphs, inventory.equation_labels))
+    equation_slots = extract_equation_display_slots(tex_files)
+    (
+        equation_label_pairs,
+        equation_aliases_by_primary,
+        equation_number_targets,
+        equation_pairing_strategy,
+        equation_pairing_warnings,
+        equation_unlabeled_equation_numbered_count,
+    ) = _build_equation_label_pairs_by_slots(
+        display_equation_paragraphs=display_equation_paragraphs,
+        equation_slots=equation_slots,
+        fallback_equation_labels=inventory.equation_labels,
+    )
+    warnings.extend(equation_pairing_warnings)
     figure_aliases_by_primary = _group_aliases_by_primary(
         inventory.figure_label_alias_to_primary,
         inventory.figure_labels,
@@ -1458,7 +1648,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             equation_prefix_tab_added += 1
 
     equation_seq_added = 0
-    for index, (paragraph, _label) in enumerate(equation_label_pairs, start=1):
+    for index, paragraph in enumerate(equation_number_targets, start=1):
         if _append_equation_seq(paragraph, seq_name="Eq", sequence_index=index):
             equation_seq_added += 1
 
@@ -1542,7 +1732,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     equation_ref_mapping, equation_num_bookmark_added, equation_labels_bound, equation_labels_missing_num = (
         _build_caption_ref_bookmark_mapping(
             label_pairs=equation_label_pairs,
-            label_aliases_by_primary=None,
+            label_aliases_by_primary=equation_aliases_by_primary or None,
             existing_bookmarks=existing_bookmarks,
             bookmark_id_seed=next_bookmark_id,
             seq_name="Eq",
@@ -1656,10 +1846,15 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_label_primary_count_from_tex": len(inventory.figure_labels),
         "table_label_count_from_tex": len(inventory.table_labels),
         "equation_label_count_from_tex": len(inventory.equation_labels),
+        "equation_slot_count_from_tex": len(equation_slots),
+        "equation_label_pair_count": len(equation_label_pairs),
+        "equation_number_target_count": len(equation_number_targets),
+        "equation_unlabeled_equation_numbered_count": equation_unlabeled_equation_numbered_count,
         "figure_label_pair_count": len(figure_label_pairs),
         "table_label_pair_count": len(table_label_pairs),
         "figure_labels_skipped_by_alignment_count": len(figure_labels_skipped_by_alignment),
         "table_labels_skipped_by_alignment_count": len(table_labels_skipped_by_alignment),
+        "equation_pairing_warning_count": len(equation_pairing_warnings),
         "figure_caption_seq_added": figure_seq_added,
         "table_caption_seq_added": table_seq_added,
         "equation_seq_added": equation_seq_added,
@@ -1725,6 +1920,20 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "table_labels_missing_number_bookmark": table_labels_missing_num,
         "equation_labels_bound_to_ref_bookmark": equation_labels_bound,
         "equation_labels_missing_number_bookmark": equation_labels_missing_num,
+        "equation_pairing_strategy": equation_pairing_strategy,
+        "equation_pairing_warnings": equation_pairing_warnings[:20],
+        "equation_alias_group_count": len(equation_aliases_by_primary),
+        "equation_slot_unlabeled_count": sum(
+            1
+            for slot in equation_slots
+            if not isinstance(slot.get("labels"), list) or not slot.get("labels")
+        ),
+        "equation_slot_unlabeled_equation_count": sum(
+            1
+            for slot in equation_slots
+            if str(slot.get("env", "")).strip().lower() == "equation"
+            and (not isinstance(slot.get("labels"), list) or not slot.get("labels"))
+        ),
         "figure_ref_unmapped_anchors": figure_anchor_unmapped[:50],
         "subfigure_ref_unmapped_anchors": subfigure_anchor_unmapped[:50],
         "table_ref_unmapped_anchors": table_anchor_unmapped[:50],
