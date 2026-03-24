@@ -7,6 +7,7 @@ docx_postprocess.py
 1. 为图/表题注补充 Word SEQ 字段编号（图 N / 表 N）；
 2. 为带标签的显示公式补充 SEQ 字段编号（(N)）；
 3. 按 TeX 标签顺序补齐缺失书签，尽量修复内部超链接跳转。
+4. 将文内图引用从内部超链接升级为 Word REF 字段（可随编号更新）。
 
 该模块是“best effort”设计：
 - 不修改源 LaTeX；
@@ -244,6 +245,15 @@ def _make_seq_field(seq_name: str, display_number: int | None = None) -> ET.Elem
     return fld
 
 
+def _make_ref_field(bookmark_name: str, display_text: str) -> ET.Element:
+    fld = ET.Element(wqn("fldSimple"))
+    fld.set(wqn("instr"), f" REF {bookmark_name} \\h ")
+    run = ET.SubElement(fld, wqn("r"))
+    text_node = ET.SubElement(run, wqn("t"))
+    text_node.text = display_text if display_text else "?"
+    return fld
+
+
 def _insert_nodes_after_ppr(paragraph: ET.Element, nodes: list[ET.Element]) -> None:
     index = 0
     children = list(paragraph)
@@ -386,6 +396,11 @@ def _candidate_anchor_names(label: str) -> list[str]:
     return names
 
 
+def _figure_num_bookmark_name(label: str) -> str:
+    digest = hashlib.sha1(label.strip().encode("utf-8")).hexdigest()[:32]
+    return f"figNum_{digest}"
+
+
 def _normalize_for_similarity(text: str) -> str:
     return re.sub(r"\s+", "", text or "").strip()
 
@@ -419,6 +434,41 @@ def _add_bookmark(
     paragraph.append(end)
 
 
+def _find_direct_seq_field(paragraph: ET.Element, seq_name: str) -> ET.Element | None:
+    keyword = f"SEQ {seq_name.upper()}"
+    for child in list(paragraph):
+        if child.tag != wqn("fldSimple"):
+            continue
+        instr = (child.get(wqn("instr"), "") or "").upper()
+        if keyword in instr:
+            return child
+    return None
+
+
+def _insert_bookmark_around_child(
+    paragraph: ET.Element,
+    child: ET.Element,
+    *,
+    bookmark_name: str,
+    bookmark_id: int,
+) -> bool:
+    children = list(paragraph)
+    try:
+        idx = children.index(child)
+    except ValueError:
+        return False
+
+    start = ET.Element(wqn("bookmarkStart"))
+    start.set(wqn("id"), str(bookmark_id))
+    start.set(wqn("name"), bookmark_name)
+    end = ET.Element(wqn("bookmarkEnd"))
+    end.set(wqn("id"), str(bookmark_id))
+
+    paragraph.insert(idx, start)
+    paragraph.insert(idx + 2, end)
+    return True
+
+
 def _repair_label_bookmarks(
     *,
     label_pairs: list[tuple[ET.Element, str]],
@@ -446,6 +496,93 @@ def _repair_label_bookmarks(
         if label_added:
             touched_labels += 1
     return added, touched_labels
+
+
+def _build_figure_ref_bookmark_mapping(
+    *,
+    figure_label_pairs: list[tuple[ET.Element, str]],
+    existing_bookmarks: set[str],
+    bookmark_id_seed: int,
+) -> tuple[dict[str, str], int, int, list[str]]:
+    """
+    为 figure 标签创建“图号专用书签”，并输出 anchor -> 书签名映射。
+    """
+    next_id = bookmark_id_seed
+    added = 0
+    labels_bound = 0
+    labels_missing_seq: list[str] = []
+    mapping: dict[str, str] = {}
+
+    for paragraph, label in figure_label_pairs:
+        label_key = label.strip()
+        if not label_key:
+            continue
+
+        number_bookmark = _figure_num_bookmark_name(label_key)
+        if number_bookmark not in existing_bookmarks:
+            seq_field = _find_direct_seq_field(paragraph, "Figure")
+            if seq_field is None:
+                labels_missing_seq.append(label_key)
+                continue
+            wrapped = _insert_bookmark_around_child(
+                paragraph,
+                seq_field,
+                bookmark_name=number_bookmark,
+                bookmark_id=next_id,
+            )
+            if not wrapped:
+                labels_missing_seq.append(label_key)
+                continue
+            existing_bookmarks.add(number_bookmark)
+            next_id += 1
+            added += 1
+
+        labels_bound += 1
+        for anchor_name in _candidate_anchor_names(label_key):
+            mapping[anchor_name] = number_bookmark
+
+    return mapping, added, labels_bound, labels_missing_seq
+
+
+def _convert_figure_hyperlinks_to_ref_fields(
+    document_root: ET.Element,
+    *,
+    anchor_to_number_bookmark: dict[str, str],
+) -> tuple[int, int, int]:
+    """
+    将文内 figure 引用从 hyperlink(anchor) 转换为 REF 字段。
+    返回：
+    - converted_link_count
+    - candidate_link_count
+    - candidate_anchor_name_count
+    """
+    converted = 0
+    candidate = 0
+    candidate_anchor_names: set[str] = set()
+
+    for paragraph in document_root.findall(".//w:p", NS):
+        children = list(paragraph)
+        for child in children:
+            if child.tag != wqn("hyperlink"):
+                continue
+            anchor_name = child.get(wqn("anchor"), "").strip()
+            if not anchor_name:
+                continue
+            bookmark_name = anchor_to_number_bookmark.get(anchor_name)
+            if not bookmark_name:
+                continue
+
+            candidate += 1
+            candidate_anchor_names.add(anchor_name)
+            display_text = "".join((node.text or "") for node in child.findall(".//w:t", NS))
+            ref_field = _make_ref_field(bookmark_name, display_text)
+
+            insertion_index = list(paragraph).index(child)
+            paragraph.remove(child)
+            paragraph.insert(insertion_index, ref_field)
+            converted += 1
+
+    return converted, candidate, len(candidate_anchor_names)
 
 
 def _repair_remaining_anchors_by_similarity(
@@ -630,6 +767,31 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += bookmark_added_equation
 
+    figure_anchor_name_all = {
+        anchor_name
+        for label in inventory.figure_labels
+        for anchor_name in _candidate_anchor_names(label)
+    }
+    figure_ref_mapping, figure_num_bookmark_added, figure_labels_bound, figure_labels_missing_num = (
+        _build_figure_ref_bookmark_mapping(
+            figure_label_pairs=figure_label_pairs,
+            existing_bookmarks=existing_bookmarks,
+            bookmark_id_seed=next_bookmark_id,
+        )
+    )
+    next_bookmark_id += figure_num_bookmark_added
+
+    figure_hyperlink_anchors_in_doc = anchors & figure_anchor_name_all
+    figure_anchor_unmapped = sorted(
+        anchor_name for anchor_name in figure_hyperlink_anchors_in_doc if anchor_name not in figure_ref_mapping
+    )
+    figure_ref_converted, figure_ref_candidate_links, figure_ref_candidate_anchor_count = (
+        _convert_figure_hyperlinks_to_ref_fields(
+            document_root,
+            anchor_to_number_bookmark=figure_ref_mapping,
+        )
+    )
+
     caption_candidates = [
         (paragraph, _paragraph_text(paragraph).strip())
         for paragraph in (figure_caption_paragraphs + table_caption_paragraphs)
@@ -674,6 +836,12 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "bookmark_added_table": bookmark_added_table,
         "bookmark_added_equation": bookmark_added_equation,
         "bookmark_added_fuzzy": bookmark_added_fuzzy,
+        "figure_num_bookmark_added": figure_num_bookmark_added,
+        "figure_ref_mapping_anchor_count": len(figure_ref_mapping),
+        "figure_ref_candidate_link_count": figure_ref_candidate_links,
+        "figure_ref_candidate_anchor_count": figure_ref_candidate_anchor_count,
+        "figure_ref_converted_link_count": figure_ref_converted,
+        "figure_ref_unmapped_anchor_count": len(figure_anchor_unmapped),
         "missing_anchor_count_after": len(missing_anchors),
     }
 
@@ -681,6 +849,9 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_labels_repaired": figure_label_repaired,
         "table_labels_repaired": table_label_repaired,
         "equation_labels_repaired": equation_label_repaired,
+        "figure_labels_bound_to_ref_bookmark": figure_labels_bound,
+        "figure_labels_missing_number_bookmark": figure_labels_missing_num,
+        "figure_ref_unmapped_anchors": figure_anchor_unmapped[:50],
         "fuzzy_anchor_repairs": fuzzy_records,
         "missing_anchors_sample_after": sorted(missing_anchors)[:50],
     }
@@ -696,6 +867,18 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     if len(inventory.equation_labels) > len(display_equation_paragraphs):
         warnings.append(
             "equation 标签数量大于 docx 可识别显示公式段落数量，部分公式书签无法自动修复。"
+        )
+    if figure_labels_missing_num:
+        warnings.append(
+            f"{len(figure_labels_missing_num)} 个 figure 标签未能绑定图号书签，相关图引用无法升级为 REF 字段。"
+        )
+    if figure_ref_candidate_links > 0 and figure_ref_converted < figure_ref_candidate_links:
+        warnings.append(
+            "部分 figure 超链接未成功转换为 REF 字段，请人工核对图引用。"
+        )
+    if figure_anchor_unmapped:
+        warnings.append(
+            f"检测到 {len(figure_anchor_unmapped)} 个 figure 风格锚点未映射到图题，已保留原超链接。"
         )
     if missing_anchors:
         warnings.append(
