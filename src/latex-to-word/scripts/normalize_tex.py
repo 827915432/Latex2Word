@@ -23,11 +23,12 @@ normalize_tex.py
    - \\cref{a,b} / \\Cref{a,b} -> \\ref{a}, \\ref{b}
 6. 在 figure / table 环境中，当检测到“\\label 紧邻且位于 \\caption 前”时，
    将其调整为“\\caption 后紧跟 \\label”；
-7. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
+7. 将 ``table*`` 环境保守降级为 ``table``（保留内容与可选参数不变）；
+8. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
    - 支持 \\newcommand / \\renewcommand / \\providecommand
    - 仅展开零参数、短小、无参数占位符的定义
    - 不覆盖原定义，只在正文使用位置做文本替换
-8. 生成结构化 JSON 报告与 Markdown 报告。
+9. 生成结构化 JSON 报告与 Markdown 报告。
 
 设计边界
 --------
@@ -1135,6 +1136,63 @@ def downgrade_subfloat_wrappers(text: str, file_path: Path, root: Path) -> tuple
     return new_text, actions
 
 
+def downgrade_table_star_environments(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    将 ``table*`` 环境保守降级为 ``table``。
+
+    背景：
+    - Pandoc 对 ``table*`` 的支持不稳定，可能出现表格保留但题注丢失；
+    - 对 Word 交付而言，题注/编号/交叉引用稳定性优先于双栏跨栏语义。
+
+    处理策略：
+    - 仅替换环境名：``\\begin{table*}`` -> ``\\begin{table}``，
+      ``\\end{table*}`` -> ``\\end{table}``；
+    - 保留可选参数、内部内容、caption/label 次序不变。
+    """
+    actions: list[ActionRecord] = []
+    begin_pattern = re.compile(r"\\begin\{table\*\}")
+    end_pattern = re.compile(r"\\end\{table\*\}")
+
+    begin_matches = list(begin_pattern.finditer(text))
+    end_matches = list(end_pattern.finditer(text))
+    if not begin_matches and not end_matches:
+        return text, actions
+
+    new_text = begin_pattern.sub(r"\\begin{table}", text)
+    new_text = end_pattern.sub(r"\\end{table}", new_text)
+
+    for match in begin_matches:
+        line_no = line_number_from_offset(text, match.start())
+        actions.append(
+            ActionRecord(
+                action_type="downgrade_table_star",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将 table* 环境降级为 table，以提升 Pandoc 到 Word 的题注保真度。",
+                details={"from_env": "table*", "to_env": "table"},
+            )
+        )
+
+    if len(begin_matches) != len(end_matches):
+        # 不中断流程，提示源文档中 table* 标记可能不成对。
+        actions.append(
+            ActionRecord(
+                action_type="table_star_env_mismatch",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=None,
+                message="检测到 table* begin/end 数量不一致，请人工核对该文件中的浮动体结构。",
+                details={
+                    "begin_count": len(begin_matches),
+                    "end_count": len(end_matches),
+                },
+            )
+        )
+
+    return new_text, actions
+
+
 def find_first_command_span(text: str, command_name: str) -> Optional[tuple[int, int]]:
     """
     在一段文本中查找第一个类似 \\command[optional]{mandatory} 的命令区间。
@@ -1336,7 +1394,8 @@ def process_tex_file(
     4. 规范化扩展交叉引用
     5. 降级 subfloat / subfigure 包装
     6. 调整 float 中 caption / label 顺序
-    7. 展开安全零参数宏
+    7. 将 table* 环境降级为 table
+    8. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -1364,6 +1423,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = reorder_label_after_caption_in_floats(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = downgrade_table_star_environments(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = expand_zero_arg_macros(text, file_path, work_root, macros)
