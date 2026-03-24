@@ -24,11 +24,12 @@ normalize_tex.py
 6. 在 figure / table 环境中，当检测到“\\label 紧邻且位于 \\caption 前”时，
    将其调整为“\\caption 后紧跟 \\label”；
 7. 将 ``table*`` 环境保守降级为 ``table``（保留内容与可选参数不变）；
-8. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
+8. 将 ``algorithm / algorithm*``（含 algorithm2e 语法）降级为 Pandoc 稳定块结构；
+9. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
    - 支持 \\newcommand / \\renewcommand / \\providecommand
    - 仅展开零参数、短小、无参数占位符的定义
    - 不覆盖原定义，只在正文使用位置做文本替换
-9. 生成结构化 JSON 报告与 Markdown 报告。
+10. 生成结构化 JSON 报告与 Markdown 报告。
 
 设计边界
 --------
@@ -1193,6 +1194,185 @@ def downgrade_table_star_environments(text: str, file_path: Path, root: Path) ->
     return new_text, actions
 
 
+def _find_command_occurrences_with_payload(
+    text: str,
+    command_name: str,
+) -> list[tuple[int, int, str]]:
+    """
+    查找 ``\\command{...}`` / ``\\command[...]{...}``，并返回 payload。
+
+    返回列表元素：
+    - start: 命令开始位置
+    - end: 命令结束位置（半开区间）
+    - payload: 花括号内文本
+    """
+    pattern = re.compile(rf"\\{re.escape(command_name)}(?:\[[^\]]*\])?")
+    results: list[tuple[int, int, str]] = []
+    cursor = 0
+
+    while True:
+        match = pattern.search(text, cursor)
+        if not match:
+            break
+
+        pos = skip_whitespace(text, match.end())
+        if pos >= len(text) or text[pos] != "{":
+            cursor = match.end()
+            continue
+
+        end = parse_balanced_group(text, pos, "{", "}")
+        if end is None:
+            cursor = match.end()
+            continue
+
+        payload = text[pos + 1 : end - 1].strip()
+        results.append((match.start(), end, payload))
+        cursor = end
+
+    return results
+
+
+def _remove_spans_from_text(text: str, spans: list[tuple[int, int]]) -> str:
+    """
+    从文本中移除若干区间（半开区间，按原文坐标）。
+    """
+    if not spans:
+        return text
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans, key=lambda item: (item[0], item[1])):
+        if start < 0 or end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        parts.append(text[cursor:start])
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def downgrade_algorithm_environments(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    将 ``algorithm / algorithm*``（含 algorithm2e 常见命令）降级为 Pandoc 稳定块结构。
+
+    输出结构（示意）：
+    - quote 块
+    - 算法标题行（保留 caption）
+    - 输入/输出行（保留 KwIn/KwOut 或 Require/Ensure）
+    - enumerate 步骤列表（按 ``\\;`` 与原换行切分）
+    """
+    actions: list[ActionRecord] = []
+    algorithm_pattern = re.compile(
+        r"\\begin\{(?P<env>algorithm\*?)\}(?P<body>.*?)\\end\{(?P=env)\}",
+        re.DOTALL,
+    )
+
+    def repl(match: re.Match) -> str:
+        nonlocal actions
+        env_name = match.group("env")
+        body = match.group("body")
+
+        caption_matches = _find_command_occurrences_with_payload(body, "caption")
+        label_matches = _find_command_occurrences_with_payload(body, "label")
+        kwin_matches = _find_command_occurrences_with_payload(body, "KwIn")
+        kwout_matches = _find_command_occurrences_with_payload(body, "KwOut")
+        require_matches = _find_command_occurrences_with_payload(body, "Require")
+        ensure_matches = _find_command_occurrences_with_payload(body, "Ensure")
+
+        caption_text = caption_matches[0][2] if caption_matches else ""
+        label_text = label_matches[0][2] if label_matches else ""
+        input_payloads = [item[2] for item in (kwin_matches + require_matches) if item[2]]
+        output_payloads = [item[2] for item in (kwout_matches + ensure_matches) if item[2]]
+
+        spans_to_remove: list[tuple[int, int]] = []
+        for start, end, _payload in (
+            caption_matches
+            + label_matches
+            + kwin_matches
+            + kwout_matches
+            + require_matches
+            + ensure_matches
+        ):
+            spans_to_remove.append((start, end))
+
+        working = _remove_spans_from_text(body, spans_to_remove)
+
+        # 处理 algorithm2e 常见控制命令与行结束符。
+        working = re.sub(r"\\BlankLine\b", "\n\n", working)
+        working = re.sub(r"\\Indp\b", "", working)
+        working = re.sub(r"\\Indm\b", "", working)
+        working = re.sub(r"\\DontPrintSemicolon\b", "", working)
+        working = re.sub(r"\\SetAlgoLined\b", "", working)
+        working = re.sub(r"\\SetKw[A-Za-z]*\s*\{[^}]*\}(?:\s*\{[^}]*\})?", "", working)
+        working = working.replace("\\;", "\n")
+
+        step_candidates = re.split(r"\n+|\\\\", working)
+        step_items: list[str] = []
+        for raw in step_candidates:
+            line = raw.strip()
+            if not line:
+                continue
+
+            line = re.sub(r"\\emph\s*\{([^}]*)\}\s*", r"\1 ", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if not line:
+                continue
+            if line in {"\\", "\\par"}:
+                continue
+            step_items.append(line)
+
+        title = caption_text if caption_text else "Algorithm"
+        lines: list[str] = ["\\begin{quote}"]
+
+        heading = f"\\noindent\\textbf{{Algorithm: {title}}}"
+        if label_text:
+            heading += f"\\label{{{label_text}}}"
+        lines.append(heading)
+
+        if input_payloads:
+            lines.append(f"\\par\\textbf{{Input:}} {'；'.join(input_payloads)}")
+        if output_payloads:
+            lines.append(f"\\par\\textbf{{Output:}} {'；'.join(output_payloads)}")
+
+        if step_items:
+            lines.append("\\begin{enumerate}")
+            for item in step_items:
+                lines.append(f"\\item {item}")
+            lines.append("\\end{enumerate}")
+
+        lines.append("\\end{quote}")
+
+        line_no = line_number_from_offset(text, match.start())
+        actions.append(
+            ActionRecord(
+                action_type="downgrade_algorithm_environment",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将 algorithm 环境降级为 quote+enumerate 块结构，以提升 Pandoc 转 Word 的稳定性。",
+                details={
+                    "environment": env_name,
+                    "caption_preserved": bool(caption_text),
+                    "label_preserved": bool(label_text),
+                    "input_count": len(input_payloads),
+                    "output_count": len(output_payloads),
+                    "step_count": len(step_items),
+                },
+            )
+        )
+
+        return "\n".join(lines)
+
+    new_text = algorithm_pattern.sub(repl, text)
+    return new_text, actions
+
+
 def find_first_command_span(text: str, command_name: str) -> Optional[tuple[int, int]]:
     """
     在一段文本中查找第一个类似 \\command[optional]{mandatory} 的命令区间。
@@ -1395,7 +1575,8 @@ def process_tex_file(
     5. 降级 subfloat / subfigure 包装
     6. 调整 float 中 caption / label 顺序
     7. 将 table* 环境降级为 table
-    8. 展开安全零参数宏
+    8. 将 algorithm 环境降级为 Pandoc 稳定块结构
+    9. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -1426,6 +1607,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = downgrade_table_star_environments(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = downgrade_algorithm_environments(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = expand_zero_arg_macros(text, file_path, work_root, macros)
@@ -2032,6 +2216,9 @@ def main() -> int:
 
     if any(action.action_type == "expand_zero_arg_macro" for action in action_log):
         recommendations.append("部分零参数宏已展开；若正文存在复杂自定义命令，仍需在后续阶段重点复核。")
+
+    if any(action.action_type == "downgrade_algorithm_environment" for action in action_log):
+        recommendations.append("algorithm 环境已降级为块级结构；请在 Word 中复核伪代码标题、步骤换行与引用文本。")
 
     if any(action.action_type.startswith("skip_") for action in action_log):
         recommendations.append("存在被跳过的复杂宏定义；这些对象不应被视为已自动处理。")
