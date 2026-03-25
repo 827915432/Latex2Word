@@ -22,7 +22,7 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from xml.etree import ElementTree as ET
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -88,6 +88,12 @@ TOKEN_PATTERN = re.compile(r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+
 LABEL_CMD_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
 ALGORITHM_TITLE_PATTERN = re.compile(r"^\s*(?:algorithm|算法)\s*:", re.IGNORECASE)
 ALGORITHM_IO_PATTERN = re.compile(r"^\s*(?:input|output|输入|输出)\s*:", re.IGNORECASE)
+
+EQUATION_SEQ_NAME = "MTEqn"
+EQUATION_DISPLAY_SEQ_SWITCHES = r"\c \* Arabic \* MERGEFORMAT"
+EQUATION_HINT_SEQ_SWITCHES = r"\h \* MERGEFORMAT"
+LEGACY_EQUATION_SEQ_NAMES = ("Eq", "EQ")
+MATHTYPE_EQUATION_BOOKMARK_PREFIX = "ZEqnNum"
 
 
 @dataclass
@@ -818,9 +824,18 @@ def _make_tab_run() -> ET.Element:
     return run
 
 
-def _make_seq_field(seq_name: str, display_number: int | None = None) -> ET.Element:
+def _make_seq_field(
+    seq_name: str,
+    display_number: int | None = None,
+    *,
+    field_switches: str = r"\* ARABIC",
+) -> ET.Element:
     fld = ET.Element(wqn("fldSimple"))
-    fld.set(wqn("instr"), f"SEQ {seq_name} \\* ARABIC")
+    instr = f"SEQ {seq_name}"
+    switches = (field_switches or "").strip()
+    if switches:
+        instr = f"{instr} {switches}"
+    fld.set(wqn("instr"), instr)
     run = ET.SubElement(fld, wqn("r"))
     text_node = ET.SubElement(run, wqn("t"))
     text_node.text = str(display_number) if display_number is not None else ""
@@ -834,6 +849,39 @@ def _make_ref_field(bookmark_name: str, display_text: str) -> ET.Element:
     text_node = ET.SubElement(run, wqn("t"))
     text_node.text = display_text if display_text else "?"
     return fld
+
+
+def _make_field_char_run(field_char_type: str) -> ET.Element:
+    run = ET.Element(wqn("r"))
+    fld_char = ET.SubElement(run, wqn("fldChar"))
+    fld_char.set(wqn("fldCharType"), field_char_type)
+    return run
+
+
+def _make_instr_text_run(instr_text: str) -> ET.Element:
+    run = ET.Element(wqn("r"))
+    instr_node = ET.SubElement(run, wqn("instrText"))
+    instr_node.set(xmlqn("space"), "preserve")
+    instr_node.text = f" {instr_text.strip()} "
+    return run
+
+
+def _build_simple_ref_nodes(bookmark_name: str, display_text: str) -> list[ET.Element]:
+    return [_make_ref_field(bookmark_name, display_text)]
+
+
+def _build_mathtype_equation_ref_nodes(bookmark_name: str, display_text: str) -> list[ET.Element]:
+    text = display_text if display_text else "(?)"
+    return [
+        _make_field_char_run("begin"),
+        _make_instr_text_run(f"GOTOBUTTON {bookmark_name}  \\* MERGEFORMAT"),
+        _make_field_char_run("begin"),
+        _make_instr_text_run(f"REF {bookmark_name} \\* Charformat \\! \\* MERGEFORMAT"),
+        _make_field_char_run("separate"),
+        _make_run(text),
+        _make_field_char_run("end"),
+        _make_field_char_run("end"),
+    ]
 
 
 def _insert_nodes_after_ppr(paragraph: ET.Element, nodes: list[ET.Element]) -> None:
@@ -854,6 +902,8 @@ def _run_text(run: ET.Element) -> str:
 
 def _run_text_matches_paren(run: ET.Element, paren: str) -> bool:
     text = _run_text(run)
+    if not text and run.tag == wqn("r"):
+        text = "".join((node.text or "") for node in run.findall("./w:instrText", NS))
     if not text:
         return False
     compact = re.sub(r"\s+", "", text)
@@ -864,15 +914,16 @@ def _set_run_text(run: ET.Element, text: str) -> bool:
     if run.tag != wqn("r"):
         return False
     text_nodes = run.findall("./w:t", NS)
-    if not text_nodes:
+    target_nodes = text_nodes if text_nodes else run.findall("./w:instrText", NS)
+    if not target_nodes:
         return False
     changed = False
-    for idx, node in enumerate(text_nodes):
+    for idx, node in enumerate(target_nodes):
         target = text if idx == 0 else ""
         if (node.text or "") != target:
             node.text = target
             changed = True
-        if xmlqn("space") in node.attrib:
+        if node.tag == wqn("t") and xmlqn("space") in node.attrib:
             del node.attrib[xmlqn("space")]
     return changed
 
@@ -889,13 +940,91 @@ def _find_first_math_child_index(paragraph: ET.Element) -> int:
 
 
 def _find_eq_seq_child_index(paragraph: ET.Element) -> int:
+    seq_candidates = {f"SEQ {EQUATION_SEQ_NAME.upper()}"}
+    seq_candidates.update(f"SEQ {name.upper()}" for name in LEGACY_EQUATION_SEQ_NAMES)
     for idx, child in enumerate(list(paragraph)):
         if child.tag != wqn("fldSimple"):
             continue
         instr = (child.get(wqn("instr"), "") or "").upper()
-        if "SEQ EQ" in instr:
+        if any(candidate in instr for candidate in seq_candidates):
             return idx
     return -1
+
+
+def _paragraph_has_equation_seq_field(paragraph: ET.Element) -> bool:
+    if _paragraph_has_seq_field(paragraph, EQUATION_SEQ_NAME):
+        return True
+    for legacy_name in LEGACY_EQUATION_SEQ_NAMES:
+        if _paragraph_has_seq_field(paragraph, legacy_name):
+            return True
+    return False
+
+
+def _normalize_equation_display_seq_fields(paragraph: ET.Element) -> bool:
+    """
+    将公式“显示编号”字段规范化为：
+    `SEQ MTEqn \\c \\* Arabic \\* MERGEFORMAT`
+    """
+    changed = False
+    seq_tokens = [EQUATION_SEQ_NAME, *LEGACY_EQUATION_SEQ_NAMES]
+    seq_tokens_upper = tuple(f"SEQ {name.upper()}" for name in seq_tokens)
+    target_instr = f"SEQ {EQUATION_SEQ_NAME} {EQUATION_DISPLAY_SEQ_SWITCHES}"
+
+    for child in list(paragraph):
+        if child.tag != wqn("fldSimple"):
+            continue
+        raw_instr = child.get(wqn("instr"), "") or ""
+        instr_upper = raw_instr.upper()
+        if not any(token in instr_upper for token in seq_tokens_upper):
+            continue
+        # 跳过 hint 域（理论上 hint 使用复杂域 instrText，不应出现在 fldSimple）
+        if "\\H" in instr_upper and "\\C" not in instr_upper:
+            continue
+        if raw_instr.strip() == target_instr:
+            continue
+        child.set(wqn("instr"), target_instr)
+        changed = True
+    return changed
+
+
+def _paragraph_has_mathtype_number_macrobutton(paragraph: ET.Element) -> bool:
+    for node in paragraph.findall(".//w:instrText", NS):
+        instr = (node.text or "").upper()
+        if "MACROBUTTON MTPLACEREF" in instr:
+            return True
+    return False
+
+
+def _ensure_equation_number_macrobutton_wrapper(paragraph: ET.Element) -> bool:
+    """
+    确保公式编号区使用 MathType 外层域：
+    { MACROBUTTON MTPlaceRef \\* MERGEFORMAT (SEQ MTEqn) }
+    """
+    if _paragraph_has_mathtype_number_macrobutton(paragraph):
+        return False
+
+    seq_idx = _find_eq_seq_child_index(paragraph)
+    if seq_idx < 0:
+        return False
+
+    children = list(paragraph)
+    left_idx = seq_idx - 1 if seq_idx > 0 and _run_text_matches_paren(children[seq_idx - 1], "(") else seq_idx
+    right_idx = seq_idx + 1 if seq_idx + 1 < len(children) and _run_text_matches_paren(children[seq_idx + 1], ")") else seq_idx
+
+    prefix_nodes = [
+        _make_field_char_run("begin"),
+        _make_instr_text_run("MACROBUTTON MTPlaceRef \\* MERGEFORMAT"),
+        _make_field_char_run("begin"),
+        _make_instr_text_run(f"SEQ {EQUATION_SEQ_NAME} {EQUATION_HINT_SEQ_SWITCHES}"),
+        _make_field_char_run("end"),
+    ]
+
+    for offset, node in enumerate(prefix_nodes):
+        paragraph.insert(left_idx + offset, node)
+
+    suffix_insert_idx = right_idx + len(prefix_nodes) + 1
+    paragraph.insert(suffix_insert_idx, _make_field_char_run("end"))
+    return True
 
 
 def _ensure_equation_prefix_tab(paragraph: ET.Element) -> bool:
@@ -916,7 +1045,7 @@ def _ensure_equation_prefix_tab(paragraph: ET.Element) -> bool:
 
 def _ensure_equation_number_tab_layout(paragraph: ET.Element) -> bool:
     """
-    确保编号区布局为：TAB (SEQ Eq)
+    确保编号区布局为：TAB (SEQ MTEqn)
     即：tab equ tab (num)
     """
     changed = False
@@ -973,17 +1102,24 @@ def _prepend_caption_seq(
 def _append_equation_seq(
     paragraph: ET.Element,
     *,
-    seq_name: str = "Eq",
+    seq_name: str = EQUATION_SEQ_NAME,
     sequence_index: int,
 ) -> bool:
-    if _paragraph_has_seq_field(paragraph, seq_name):
-        return False
+    changed = _normalize_equation_display_seq_fields(paragraph)
+    if _paragraph_has_equation_seq_field(paragraph):
+        return changed
     text = _paragraph_text(paragraph).strip()
     if re.search(r"\(\d+\)$", text):
-        return False
+        return changed
     paragraph.append(_make_tab_run())
     paragraph.append(_make_run("("))
-    paragraph.append(_make_seq_field(seq_name, sequence_index))
+    paragraph.append(
+        _make_seq_field(
+            seq_name,
+            sequence_index,
+            field_switches=EQUATION_DISPLAY_SEQ_SWITCHES,
+        )
+    )
     paragraph.append(_make_run(")"))
     return True
 
@@ -1033,20 +1169,15 @@ def _normalize_style_name(value: str) -> str:
     return re.sub(r"\s+", "", (value or "").strip().lower())
 
 
-def _find_displayed_formula_style_id(styles_root: ET.Element) -> str:
+def _find_mt_display_equation_style_id(styles_root: ET.Element) -> str:
     """
-    在 styles.xml 中查找“显示公式”段落样式 ID。
-    优先级：
-    1. 样式名匹配 Displayed formula（忽略空白与大小写）；
-    2. styleId 精确等于 Displayedformula / DisplayedFormula（大小写不敏感）。
+    在 styles.xml 中查找 MathType 显示公式段落样式 ID（MTDisplayEquation）。
+    匹配规则：
+    - 样式名或 styleId 规范化后命中 mtdisplayequation / mathtypedisplayequation。
     """
-    target_names = {
-        "displayedformula",
-        "displayformula",
-        "公式显示",
-        "显示公式",
-    }
-    fallback_candidates: list[str] = []
+    preferred_targets = {"mtdisplayequation", "mathtypedisplayequation"}
+    preferred_id_candidates: list[str] = []
+    preferred_name_candidates: list[str] = []
 
     for style in styles_root.findall(".//w:style[@w:type='paragraph']", NS):
         style_id = (style.get(wqn("styleId"), "") or "").strip()
@@ -1054,19 +1185,22 @@ def _find_displayed_formula_style_id(styles_root: ET.Element) -> str:
             continue
 
         normalized_style_id = _normalize_style_name(style_id)
-        if normalized_style_id in {"displayedformula", "displayformula"}:
-            fallback_candidates.append(style_id)
+        if normalized_style_id in preferred_targets:
+            preferred_id_candidates.append(style_id)
 
         name_node = style.find("./w:name", NS)
         style_name = ""
         if name_node is not None:
             style_name = (name_node.get(wqn("val"), "") or "").strip()
         normalized_name = _normalize_style_name(style_name)
-        if normalized_name in target_names:
-            return style_id
+        if normalized_name in preferred_targets:
+            preferred_name_candidates.append(style_id)
 
-    if fallback_candidates:
-        return fallback_candidates[0]
+    # 按优先级返回：preferred(name) > preferred(id)
+    if preferred_name_candidates:
+        return preferred_name_candidates[0]
+    if preferred_id_candidates:
+        return preferred_id_candidates[0]
     return ""
 
 
@@ -1150,15 +1284,26 @@ def _candidate_anchor_names(label: str) -> list[str]:
 
 
 def _number_bookmark_name(object_kind: str, label: str) -> str:
+    if object_kind == "equation":
+        return _mathtype_equation_number_bookmark_name(label)
+
     digest = hashlib.sha1(label.strip().encode("utf-8")).hexdigest()[:32]
     prefix = {
         "figure": "figNum",
         "table": "tabNum",
-        "equation": "eqNum",
     }.get(object_kind, "")
     if not prefix:
         return ""
     return f"{prefix}_{digest}"
+
+
+def _mathtype_equation_number_bookmark_name(label: str) -> str:
+    """
+    MathType 风格公式号书签：`ZEqnNum##########`（确定性生成）。
+    """
+    digest = hashlib.sha1(label.strip().encode("utf-8")).hexdigest()
+    numeric = int(digest[:12], 16) % 10_000_000_000
+    return f"{MATHTYPE_EQUATION_BOOKMARK_PREFIX}{numeric:010d}"
 
 
 def _subfigure_marker_bookmark_name(label: str) -> str:
@@ -1485,6 +1630,71 @@ def _insert_bookmark_around_child(
     return True
 
 
+def _insert_bookmark_around_child_range(
+    paragraph: ET.Element,
+    start_child: ET.Element,
+    end_child: ET.Element,
+    *,
+    bookmark_name: str,
+    bookmark_id: int,
+) -> bool:
+    children = list(paragraph)
+    try:
+        start_idx = children.index(start_child)
+        end_idx = children.index(end_child)
+    except ValueError:
+        return False
+
+    if end_idx < start_idx:
+        start_idx, end_idx = end_idx, start_idx
+
+    start = ET.Element(wqn("bookmarkStart"))
+    start.set(wqn("id"), str(bookmark_id))
+    start.set(wqn("name"), bookmark_name)
+    end = ET.Element(wqn("bookmarkEnd"))
+    end.set(wqn("id"), str(bookmark_id))
+
+    paragraph.insert(start_idx, start)
+    paragraph.insert(end_idx + 2, end)
+    return True
+
+
+def _insert_equation_number_bookmark(
+    paragraph: ET.Element,
+    *,
+    seq_name: str,
+    bookmark_name: str,
+    bookmark_id: int,
+) -> bool:
+    """
+    将书签包裹在公式编号整体 `(SEQ)` 上，符合 MathType 引用期望。
+    """
+    seq_field = _find_direct_seq_field(paragraph, seq_name)
+    if seq_field is None:
+        return False
+
+    children = list(paragraph)
+    try:
+        seq_idx = children.index(seq_field)
+    except ValueError:
+        return False
+
+    start_child = seq_field
+    end_child = seq_field
+    if seq_idx > 0 and _run_text_matches_paren(children[seq_idx - 1], "("):
+        start_child = children[seq_idx - 1]
+    if seq_idx + 1 < len(children) and _run_text_matches_paren(children[seq_idx + 1], ")"):
+        end_child = children[seq_idx + 1]
+
+    return _insert_bookmark_around_child_range(
+        paragraph,
+        start_child,
+        end_child,
+        bookmark_name=bookmark_name,
+        bookmark_id=bookmark_id,
+    )
+
+
 def _find_subcaption_marker_run(paragraph: ET.Element) -> tuple[ET.Element | None, str]:
     marker_pattern = re.compile(r"^[\s\u00A0]*([\(（]\s*[A-Za-z0-9]+\s*[\)）])")
     for child in list(paragraph):
@@ -1679,7 +1889,7 @@ def _build_equation_label_pairs_by_slots(
     返回：
     - label_pairs
     - label_aliases_by_primary
-    - number_targets（需要补 SEQ Eq 的公式段落）
+    - number_targets（需要补 SEQ MTEqn 的公式段落）
     - pairing_strategy: slots / fallback_zip
     - pairing_warnings
     - unlabeled_equation_numbered_count（由 `equation` 环境触发的无标签编号数量）
@@ -1773,16 +1983,24 @@ def _build_caption_ref_bookmark_mapping(
             labels_missing_seq.append(label_key)
             continue
         if number_bookmark not in existing_bookmarks:
-            seq_field = _find_direct_seq_field(paragraph, seq_name)
-            if seq_field is None:
-                labels_missing_seq.append(label_key)
-                continue
-            wrapped = _insert_bookmark_around_child(
-                paragraph,
-                seq_field,
-                bookmark_name=number_bookmark,
-                bookmark_id=next_id,
-            )
+            if object_kind == "equation":
+                wrapped = _insert_equation_number_bookmark(
+                    paragraph,
+                    seq_name=seq_name,
+                    bookmark_name=number_bookmark,
+                    bookmark_id=next_id,
+                )
+            else:
+                seq_field = _find_direct_seq_field(paragraph, seq_name)
+                if seq_field is None:
+                    labels_missing_seq.append(label_key)
+                    continue
+                wrapped = _insert_bookmark_around_child(
+                    paragraph,
+                    seq_field,
+                    bookmark_name=number_bookmark,
+                    bookmark_id=next_id,
+                )
             if not wrapped:
                 labels_missing_seq.append(label_key)
                 continue
@@ -1809,6 +2027,7 @@ def _convert_hyperlinks_to_ref_fields(
     *,
     anchor_to_number_bookmark: dict[str, str],
     anchor_display_text: dict[str, str] | None = None,
+    ref_node_builder: Callable[[str, str], list[ET.Element]] | None = None,
 ) -> tuple[int, int, int]:
     """
     将文内 hyperlink(anchor) 转换为 REF 字段（仅处理传入映射中的锚点）。
@@ -1820,6 +2039,7 @@ def _convert_hyperlinks_to_ref_fields(
     converted = 0
     candidate = 0
     candidate_anchor_names: set[str] = set()
+    builder = ref_node_builder or _build_simple_ref_nodes
 
     for paragraph in document_root.findall(".//w:p", NS):
         children = list(paragraph)
@@ -1839,11 +2059,14 @@ def _convert_hyperlinks_to_ref_fields(
             if anchor_display_text:
                 preferred_text = anchor_display_text.get(anchor_name, "")
             display_text = preferred_text or "".join((node.text or "") for node in child.findall(".//w:t", NS))
-            ref_field = _make_ref_field(bookmark_name, display_text)
+            replacement_nodes = builder(bookmark_name, display_text)
+            if not replacement_nodes:
+                continue
 
             insertion_index = list(paragraph).index(child)
             paragraph.remove(child)
-            paragraph.insert(insertion_index, ref_field)
+            for offset, node in enumerate(replacement_nodes):
+                paragraph.insert(insertion_index + offset, node)
             converted += 1
 
     return converted, candidate, len(candidate_anchor_names)
@@ -1930,7 +2153,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     styles_root = ET.fromstring(payload["word/styles.xml"])
 
     figure_style_ids, table_style_ids, generic_caption_style_ids = _parse_caption_style_ids(styles_root)
-    displayed_formula_style_id = _find_displayed_formula_style_id(styles_root)
+    mt_display_equation_style_id = _find_mt_display_equation_style_id(styles_root)
 
     body = document_root.find("./w:body", NS)
     if body is None:
@@ -2090,7 +2313,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
 
     equation_seq_added = 0
     for index, paragraph in enumerate(equation_number_targets, start=1):
-        if _append_equation_seq(paragraph, seq_name="Eq", sequence_index=index):
+        if _append_equation_seq(paragraph, seq_name=EQUATION_SEQ_NAME, sequence_index=index):
             equation_seq_added += 1
 
     equation_number_tab_layout_fixed = 0
@@ -2098,10 +2321,15 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         if _ensure_equation_number_tab_layout(paragraph):
             equation_number_tab_layout_fixed += 1
 
+    equation_macrobutton_wrapped = 0
+    for paragraph in equation_number_targets:
+        if _ensure_equation_number_macrobutton_wrapper(paragraph):
+            equation_macrobutton_wrapped += 1
+
     equation_style_applied = 0
-    if displayed_formula_style_id:
+    if mt_display_equation_style_id:
         for paragraph in display_equation_paragraphs:
-            if _set_paragraph_style_id(paragraph, displayed_formula_style_id):
+            if _set_paragraph_style_id(paragraph, mt_display_equation_style_id):
                 equation_style_applied += 1
 
     bookmark_added_equation, equation_label_repaired = _repair_label_bookmarks(
@@ -2176,7 +2404,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             label_aliases_by_primary=equation_aliases_by_primary or None,
             existing_bookmarks=existing_bookmarks,
             bookmark_id_seed=next_bookmark_id,
-            seq_name="Eq",
+            seq_name=EQUATION_SEQ_NAME,
             object_kind="equation",
         )
     )
@@ -2228,6 +2456,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         _convert_hyperlinks_to_ref_fields(
             document_root,
             anchor_to_number_bookmark=equation_ref_mapping,
+            ref_node_builder=_build_mathtype_equation_ref_nodes,
         )
     )
 
@@ -2268,6 +2497,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             equation_seq_added,
             equation_prefix_tab_added,
             equation_number_tab_layout_fixed,
+            equation_macrobutton_wrapped,
             bookmark_added_total,
             subfigure_marker_bookmark_added,
             figure_num_bookmark_added,
@@ -2312,6 +2542,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "equation_seq_added": equation_seq_added,
         "equation_prefix_tab_added": equation_prefix_tab_added,
         "equation_number_tab_layout_fixed": equation_number_tab_layout_fixed,
+        "equation_macrobutton_wrapped": equation_macrobutton_wrapped,
         "equation_style_applied_count": equation_style_applied,
         "equation_style_candidate_count": len(display_equation_paragraphs),
         "bookmark_added_total": bookmark_added_total,
@@ -2353,7 +2584,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_labels_repaired": figure_label_repaired,
         "table_labels_repaired": table_label_repaired,
         "equation_labels_repaired": equation_label_repaired,
-        "equation_display_style_id": displayed_formula_style_id,
+        "equation_display_style_id": mt_display_equation_style_id,
         "figure_labels_bound_to_ref_bookmark": figure_labels_bound,
         "figure_labels_missing_number_bookmark": figure_labels_missing_num,
         "subfigure_labels_bound_to_marker_bookmark": subfigure_labels_bound,
@@ -2426,9 +2657,9 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "equation 标签数量大于 docx 可识别显示公式段落数量，部分公式书签无法自动修复。"
         )
-    if display_equation_paragraphs and not displayed_formula_style_id:
+    if display_equation_paragraphs and not mt_display_equation_style_id:
         warnings.append(
-            "未在 reference.docx 中检测到 Displayed formula 样式；显示公式段落保持原样式。"
+            "未在 reference.docx 中检测到 MTDisplayEquation 样式；显示公式段落保持原样式。"
         )
     if figure_labels_missing_num:
         warnings.append(
