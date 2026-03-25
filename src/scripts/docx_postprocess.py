@@ -7,7 +7,7 @@ docx_postprocess.py
 1. 为图/表题注补充 Word SEQ 字段编号（图 N / 表 N）；
 2. 为带标签的显示公式补充 SEQ 字段编号（(N)）；
 3. 按 TeX 标签顺序补齐缺失书签，尽量修复内部超链接跳转。
-4. 将文内图/表/公式引用从内部超链接升级为 Word REF 字段（可随编号更新）。
+4. 将文内图/表/公式/章节引用从内部超链接升级为 Word REF 字段（可随编号更新）。
 
 该模块是“best effort”设计：
 - 不修改源 LaTeX；
@@ -83,6 +83,15 @@ DISPLAY_EQUATION_ENVS = {
     "eqnarray",
     "eqnarray*",
 }
+HEADING_COMMANDS = (
+    "part",
+    "chapter",
+    "section",
+    "subsection",
+    "subsubsection",
+    "paragraph",
+    "subparagraph",
+)
 
 TOKEN_PATTERN = re.compile(r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+)\}")
 LABEL_CMD_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
@@ -103,6 +112,7 @@ class LabelInventory:
     figure_label_alias_to_primary: dict[str, str] = field(default_factory=dict)
     table_labels: list[str] = field(default_factory=list)
     equation_labels: list[str] = field(default_factory=list)
+    paragraph_labels: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -439,12 +449,15 @@ def extract_label_inventory(tex_files: list[Path]) -> LabelInventory:
         if label not in normalized_alias:
             normalized_alias[label] = label
 
+    _paragraph_slots, paragraph_labels = extract_paragraph_slots(tex_files)
+
     return LabelInventory(
         figure_labels=figure_primary_labels,
         figure_all_labels=figure_all_labels,
         figure_label_alias_to_primary=normalized_alias,
         table_labels=_dedup_keep_order(table_labels),
         equation_labels=_dedup_keep_order(equation_labels),
+        paragraph_labels=paragraph_labels,
     )
 
 
@@ -595,6 +608,63 @@ def extract_equation_display_slots(tex_files: list[Path]) -> list[dict[str, obje
                 break
 
     return slots
+
+
+def _find_heading_command_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for command_name in HEADING_COMMANDS:
+        for start, end in _find_command_spans(text, command_name):
+            spans.append((start, end, command_name))
+    spans.sort(key=lambda item: item[0])
+    return spans
+
+
+def _extract_heading_slot_labels(text: str, start: int, end: int) -> list[str]:
+    labels: list[str] = []
+    labels.extend(_extract_labels_from_body_text(text[start:end]))
+
+    cursor = _skip_whitespace(text, end)
+    while cursor < len(text):
+        match = LABEL_CMD_PATTERN.match(text, cursor)
+        if not match:
+            break
+        label = (match.group(1) or "").strip()
+        if label:
+            labels.append(label)
+        cursor = _skip_whitespace(text, match.end())
+
+    return _dedup_keep_order(labels)
+
+
+def extract_paragraph_slots(tex_files: list[Path]) -> tuple[list[dict[str, object]], list[str]]:
+    """
+    提取 TeX 标题槽位，并收集槽位绑定的段落标签。
+
+    返回：
+    - paragraph_slots: [{"command": "section", "labels": [...]}, ...]
+    - paragraph_labels: 按出现顺序去重后的全部段落标签
+    """
+    paragraph_slots: list[dict[str, object]] = []
+    paragraph_labels: list[str] = []
+
+    for tex_file in tex_files:
+        try:
+            raw = tex_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw = tex_file.read_text(encoding="gbk")
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        text = _strip_comments(raw)
+        for start, end, command_name in _find_heading_command_spans(text):
+            labels = _extract_heading_slot_labels(text, start, end)
+            paragraph_slots.append({"command": command_name, "labels": labels})
+            paragraph_labels.extend(labels)
+
+    return paragraph_slots, _dedup_keep_order(paragraph_labels)
 
 
 def _paragraph_style_id(paragraph: ET.Element) -> str:
@@ -973,9 +1043,19 @@ def _make_seq_field(
     return fld
 
 
-def _make_ref_field(bookmark_name: str, display_text: str) -> ET.Element:
+def _make_ref_field(
+    bookmark_name: str,
+    display_text: str,
+    *,
+    field_switches: str = r"\h",
+) -> ET.Element:
     fld = ET.Element(wqn("fldSimple"))
-    fld.set(wqn("instr"), f" REF {bookmark_name} \\h ")
+    instr = f" REF {bookmark_name}"
+    switches = (field_switches or "").strip()
+    if switches:
+        instr = f"{instr} {switches}"
+    instr = f"{instr} "
+    fld.set(wqn("instr"), instr)
     run = ET.SubElement(fld, wqn("r"))
     text_node = ET.SubElement(run, wqn("t"))
     text_node.text = display_text if display_text else "?"
@@ -999,6 +1079,10 @@ def _make_instr_text_run(instr_text: str) -> ET.Element:
 
 def _build_simple_ref_nodes(bookmark_name: str, display_text: str) -> list[ET.Element]:
     return [_make_ref_field(bookmark_name, display_text)]
+
+
+def _build_heading_number_ref_nodes(bookmark_name: str, display_text: str) -> list[ET.Element]:
+    return [_make_ref_field(bookmark_name, display_text, field_switches=r"\h \n")]
 
 
 def _build_mathtype_equation_ref_nodes(bookmark_name: str, display_text: str) -> list[ET.Element]:
@@ -1268,6 +1352,46 @@ def _is_display_equation_paragraph(paragraph: ET.Element) -> bool:
     return True
 
 
+def _parse_heading_style_ids(styles_root: ET.Element) -> set[str]:
+    heading_style_ids: set[str] = set()
+    for style in styles_root.findall(".//w:style[@w:type='paragraph']", NS):
+        style_id = (style.get(wqn("styleId"), "") or "").strip()
+        if not style_id:
+            continue
+
+        name_node = style.find("./w:name", NS)
+        style_name = ""
+        if name_node is not None:
+            style_name = (name_node.get(wqn("val"), "") or "").strip().lower()
+        style_id_lower = style_id.lower()
+        if (
+            style_id_lower.startswith("heading")
+            or style_name.startswith("heading")
+            or style_name.startswith("标题")
+        ):
+            heading_style_ids.add(style_id)
+            continue
+
+        ppr = style.find("./w:pPr", NS)
+        if ppr is not None and ppr.find("./w:outlineLvl", NS) is not None:
+            heading_style_ids.add(style_id)
+    return heading_style_ids
+
+
+def _is_heading_paragraph(paragraph: ET.Element, heading_style_ids: set[str]) -> bool:
+    style_id = _paragraph_style_id(paragraph)
+    if style_id and style_id in heading_style_ids:
+        return True
+
+    ppr = paragraph.find("./w:pPr", NS)
+    if ppr is not None and ppr.find("./w:outlineLvl", NS) is not None:
+        return True
+
+    if style_id and style_id.lower().startswith("heading"):
+        return True
+    return False
+
+
 def _parse_caption_style_ids(styles_root: ET.Element) -> tuple[set[str], set[str], set[str]]:
     figure_style_ids: set[str] = {"ImageCaption"}
     table_style_ids: set[str] = {"TableCaption"}
@@ -1422,6 +1546,7 @@ def _number_bookmark_name(object_kind: str, label: str) -> str:
     prefix = {
         "figure": "figNum",
         "table": "tabNum",
+        "paragraph": "paraNum",
     }.get(object_kind, "")
     if not prefix:
         return ""
@@ -2008,6 +2133,75 @@ def _group_aliases_by_primary(
     return grouped
 
 
+def _build_paragraph_label_pairs_by_slots(
+    *,
+    heading_paragraphs: list[ET.Element],
+    paragraph_slots: list[dict[str, object]],
+    fallback_labels: list[str],
+) -> tuple[list[tuple[ET.Element, str]], str, list[str], list[str]]:
+    """
+    基于 TeX 标题槽位对齐 docx 标题段落，输出 (heading_paragraph, label) 配对。
+
+    返回：
+    - label_pairs
+    - pairing_strategy: slots / slots_prefix_align / fallback_zip
+    - pairing_warnings
+    - labels_skipped_by_pairing
+    """
+    warnings: list[str] = []
+    skipped_labels: list[str] = []
+    seen_labels: set[str] = set()
+
+    if heading_paragraphs and paragraph_slots:
+        pair_count = min(len(heading_paragraphs), len(paragraph_slots))
+        pairs: list[tuple[ET.Element, str]] = []
+
+        for index in range(pair_count):
+            raw_labels = paragraph_slots[index].get("labels", [])
+            if isinstance(raw_labels, list):
+                labels = _dedup_keep_order(str(value) for value in raw_labels)
+            else:
+                labels = []
+            if not labels:
+                continue
+
+            paragraph = heading_paragraphs[index]
+            for label in labels:
+                label_key = label.strip()
+                if not label_key or label_key in seen_labels:
+                    continue
+                seen_labels.add(label_key)
+                pairs.append((paragraph, label_key))
+
+        if len(paragraph_slots) > pair_count:
+            for slot in paragraph_slots[pair_count:]:
+                raw_labels = slot.get("labels", [])
+                if isinstance(raw_labels, list):
+                    skipped_labels.extend(str(value) for value in raw_labels)
+
+        strategy = "slots" if len(paragraph_slots) == len(heading_paragraphs) else "slots_prefix_align"
+        if strategy == "slots_prefix_align":
+            warnings.append(
+                "段落槽位数与 docx 标题段落数不一致，已采用槽位前缀对齐配对（slots_prefix_align）。"
+            )
+        return pairs, strategy, warnings, _dedup_keep_order(skipped_labels)
+
+    fallback_pairs: list[tuple[ET.Element, str]] = []
+    for paragraph, label in zip(heading_paragraphs, fallback_labels):
+        label_key = label.strip()
+        if not label_key or label_key in seen_labels:
+            continue
+        seen_labels.add(label_key)
+        fallback_pairs.append((paragraph, label_key))
+
+    if heading_paragraphs and fallback_labels:
+        warnings.append("未提取到段落槽位，已回退到顺序配对（fallback_zip）。")
+    if len(fallback_labels) > len(fallback_pairs):
+        skipped_labels.extend(fallback_labels[len(fallback_pairs) :])
+
+    return fallback_pairs, "fallback_zip", warnings, _dedup_keep_order(skipped_labels)
+
+
 def _build_equation_label_pairs_by_slots(
     *,
     display_equation_paragraphs: list[ET.Element],
@@ -2153,6 +2347,97 @@ def _build_caption_ref_bookmark_mapping(
     return mapping, added, labels_bound, labels_missing_seq
 
 
+def _paragraph_has_bookmark(paragraph: ET.Element, bookmark_name: str) -> bool:
+    target = bookmark_name.strip()
+    if not target:
+        return False
+    for node in paragraph.findall(".//w:bookmarkStart", NS):
+        if (node.get(wqn("name"), "") or "").strip() == target:
+            return True
+    return False
+
+
+def _choose_paragraph_number_bookmark_name(
+    *,
+    paragraph: ET.Element,
+    base_name: str,
+    existing_bookmarks: set[str],
+) -> str:
+    """
+    为段落编号引用选择稳定书签名：
+    - 优先使用 `base_name`；
+    - 若同名书签已存在但不在当前段落，则分配 `base_name_1/2/...`。
+    """
+    base = base_name.strip()
+    if not base:
+        return ""
+
+    if _paragraph_has_bookmark(paragraph, base):
+        return base
+    if base not in existing_bookmarks:
+        return base
+
+    suffix = 1
+    while True:
+        candidate = f"{base}_{suffix}"
+        if _paragraph_has_bookmark(paragraph, candidate):
+            return candidate
+        if candidate not in existing_bookmarks:
+            return candidate
+        suffix += 1
+
+
+def _build_paragraph_ref_bookmark_mapping(
+    *,
+    label_pairs: list[tuple[ET.Element, str]],
+    existing_bookmarks: set[str],
+    bookmark_id_seed: int,
+) -> tuple[dict[str, str], int, int, list[str]]:
+    """
+    为段落标签创建“编号专用书签”（paraNum_*），并输出 anchor -> 书签名映射。
+    """
+    next_id = bookmark_id_seed
+    added = 0
+    labels_bound = 0
+    labels_missing_bookmark: list[str] = []
+    mapping: dict[str, str] = {}
+
+    for paragraph, label in label_pairs:
+        label_key = label.strip()
+        if not label_key:
+            continue
+
+        base_name = _number_bookmark_name("paragraph", label_key)
+        if not base_name:
+            labels_missing_bookmark.append(label_key)
+            continue
+
+        bookmark_name = _choose_paragraph_number_bookmark_name(
+            paragraph=paragraph,
+            base_name=base_name,
+            existing_bookmarks=existing_bookmarks,
+        )
+        if not bookmark_name:
+            labels_missing_bookmark.append(label_key)
+            continue
+
+        if not _paragraph_has_bookmark(paragraph, bookmark_name):
+            _add_bookmark(
+                paragraph,
+                bookmark_name=bookmark_name,
+                bookmark_id=next_id,
+            )
+            existing_bookmarks.add(bookmark_name)
+            next_id += 1
+            added += 1
+
+        labels_bound += 1
+        for anchor_name in _candidate_anchor_names(label_key):
+            mapping.setdefault(anchor_name, bookmark_name)
+
+    return mapping, added, labels_bound, labels_missing_bookmark
+
+
 def _convert_hyperlinks_to_ref_fields(
     document_root: ET.Element,
     *,
@@ -2284,6 +2569,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     styles_root = ET.fromstring(payload["word/styles.xml"])
 
     figure_style_ids, table_style_ids, generic_caption_style_ids = _parse_caption_style_ids(styles_root)
+    heading_style_ids = _parse_heading_style_ids(styles_root)
     mt_display_equation_style_id = _find_mt_display_equation_style_id(styles_root)
     preferred_table_style_id = _find_preferred_table_style_id(styles_root)
 
@@ -2315,11 +2601,20 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     figure_caption_paragraphs: list[ET.Element] = []
     table_caption_paragraphs: list[ET.Element] = []
     display_equation_paragraphs: list[ET.Element] = []
+    heading_paragraphs: list[ET.Element] = []
 
     for index, element in enumerate(elements):
         if element.tag != wqn("p"):
             continue
         style_id = _paragraph_style_id(element)
+        is_display_equation = _is_display_equation_paragraph(element)
+        if is_display_equation:
+            display_equation_paragraphs.append(element)
+
+        # 避免把误套“标题样式”的显示公式段落计入标题槽位，导致段落标签错配。
+        if not is_display_equation and _is_heading_paragraph(element, heading_style_ids):
+            heading_paragraphs.append(element)
+
         if style_id in figure_style_ids:
             figure_caption_paragraphs.append(element)
         elif style_id in table_style_ids:
@@ -2330,9 +2625,6 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
                 table_caption_paragraphs.append(element)
             else:
                 figure_caption_paragraphs.append(element)
-
-        if _is_display_equation_paragraph(element):
-            display_equation_paragraphs.append(element)
 
     anchors = {
         node.get(wqn("anchor"), "")
@@ -2375,6 +2667,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             table_seq_added += 1
 
     figure_slots, table_slots = extract_float_slots(tex_files)
+    paragraph_slots, paragraph_labels_from_slots = extract_paragraph_slots(tex_files)
     (
         figure_label_pairs,
         figure_labels_skipped_by_pairing,
@@ -2415,6 +2708,18 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         fallback_equation_labels=inventory.equation_labels,
     )
     warnings.extend(equation_pairing_warnings)
+    paragraph_labels = inventory.paragraph_labels or paragraph_labels_from_slots
+    (
+        paragraph_label_pairs,
+        paragraph_pairing_strategy,
+        paragraph_pairing_warnings,
+        paragraph_labels_skipped_by_pairing,
+    ) = _build_paragraph_label_pairs_by_slots(
+        heading_paragraphs=heading_paragraphs,
+        paragraph_slots=paragraph_slots,
+        fallback_labels=paragraph_labels,
+    )
+    warnings.extend(paragraph_pairing_warnings)
     figure_aliases_by_primary = _group_aliases_by_primary(
         inventory.figure_label_alias_to_primary,
         inventory.figure_labels,
@@ -2480,6 +2785,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += bookmark_added_equation
 
+    bookmark_added_paragraph, paragraph_label_repaired = _repair_label_bookmarks(
+        label_pairs=paragraph_label_pairs,
+        missing_anchors=missing_anchors,
+        existing_bookmarks=existing_bookmarks,
+        bookmark_id_seed=next_bookmark_id,
+    )
+    next_bookmark_id += bookmark_added_paragraph
+
     figure_anchor_labels = inventory.figure_all_labels or inventory.figure_labels
     subfigure_candidate_labels = [
         label
@@ -2516,6 +2829,11 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         for label in inventory.equation_labels
         for anchor_name in _candidate_anchor_names(label)
     }
+    paragraph_anchor_name_all = {
+        anchor_name
+        for label in paragraph_labels
+        for anchor_name in _candidate_anchor_names(label)
+    }
     figure_ref_mapping, figure_num_bookmark_added, figure_labels_bound, figure_labels_missing_num = (
         _build_caption_ref_bookmark_mapping(
             label_pairs=figure_label_pairs,
@@ -2550,6 +2868,18 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += equation_num_bookmark_added
 
+    (
+        paragraph_ref_mapping,
+        paragraph_num_bookmark_added,
+        paragraph_labels_bound,
+        paragraph_labels_missing_bookmark,
+    ) = _build_paragraph_ref_bookmark_mapping(
+        label_pairs=paragraph_label_pairs,
+        existing_bookmarks=existing_bookmarks,
+        bookmark_id_seed=next_bookmark_id,
+    )
+    next_bookmark_id += paragraph_num_bookmark_added
+
     subfigure_anchor_name_all = {
         anchor_name
         for label in subfigure_detected_labels
@@ -2559,6 +2889,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     figure_hyperlink_anchors_in_doc = anchors & figure_anchor_name_all
     table_hyperlink_anchors_in_doc = anchors & table_anchor_name_all
     equation_hyperlink_anchors_in_doc = anchors & equation_anchor_name_all
+    paragraph_hyperlink_anchors_in_doc = anchors & paragraph_anchor_name_all
     subfigure_anchor_unmapped = sorted(
         anchor_name
         for anchor_name in subfigure_hyperlink_anchors_in_doc
@@ -2572,6 +2903,11 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     equation_anchor_unmapped = sorted(
         anchor_name for anchor_name in equation_hyperlink_anchors_in_doc if anchor_name not in equation_ref_mapping
+    )
+    paragraph_anchor_unmapped = sorted(
+        anchor_name
+        for anchor_name in paragraph_hyperlink_anchors_in_doc
+        if anchor_name not in paragraph_ref_mapping
     )
     subfigure_ref_converted, subfigure_ref_candidate_links, subfigure_ref_candidate_anchor_count = (
         _convert_hyperlinks_to_ref_fields(
@@ -2599,12 +2935,20 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             ref_node_builder=_build_mathtype_equation_ref_nodes,
         )
     )
+    paragraph_ref_converted, paragraph_ref_candidate_links, paragraph_ref_candidate_anchor_count = (
+        _convert_hyperlinks_to_ref_fields(
+            document_root,
+            anchor_to_number_bookmark=paragraph_ref_mapping,
+            ref_node_builder=_build_heading_number_ref_nodes,
+        )
+    )
 
     resolved_anchor_names = (
         set(subfigure_ref_mapping)
         | set(figure_ref_mapping)
         | set(table_ref_mapping)
         | set(equation_ref_mapping)
+        | set(paragraph_ref_mapping)
     )
     missing_anchors.difference_update(resolved_anchor_names)
 
@@ -2626,6 +2970,8 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         + bookmark_added_figure
         + bookmark_added_table
         + bookmark_added_equation
+        + bookmark_added_paragraph
+        + paragraph_num_bookmark_added
         + bookmark_added_fuzzy
     )
     modified = any(
@@ -2644,10 +2990,12 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             figure_num_bookmark_added,
             table_num_bookmark_added,
             equation_num_bookmark_added,
+            paragraph_num_bookmark_added,
             subfigure_ref_converted,
             figure_ref_converted,
             table_ref_converted,
             equation_ref_converted,
+            paragraph_ref_converted,
         )
     )
 
@@ -2662,14 +3010,18 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_caption_para_count": len(figure_caption_paragraphs),
         "table_caption_para_count": len(table_caption_paragraphs),
         "display_equation_para_count": len(display_equation_paragraphs),
+        "heading_para_count": len(heading_paragraphs),
         "figure_slot_count_from_tex": len(figure_slots),
         "table_slot_count_from_tex": len(table_slots),
         "figure_label_count_from_tex": len(inventory.figure_all_labels),
         "figure_label_primary_count_from_tex": len(inventory.figure_labels),
         "table_label_count_from_tex": len(inventory.table_labels),
         "equation_label_count_from_tex": len(inventory.equation_labels),
+        "paragraph_label_count_from_tex": len(paragraph_labels),
         "equation_slot_count_from_tex": len(equation_slots),
+        "paragraph_slot_count_from_tex": len(paragraph_slots),
         "equation_label_pair_count": len(equation_label_pairs),
+        "paragraph_label_pair_count": len(paragraph_label_pairs),
         "equation_number_target_count": len(equation_number_targets),
         "equation_unlabeled_equation_numbered_count": equation_unlabeled_equation_numbered_count,
         "figure_label_pair_count": len(figure_label_pairs),
@@ -2681,6 +3033,8 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_pairing_warning_count": len(figure_pairing_warnings),
         "table_pairing_warning_count": len(table_pairing_warnings),
         "equation_pairing_warning_count": len(equation_pairing_warnings),
+        "paragraph_pairing_warning_count": len(paragraph_pairing_warnings),
+        "paragraph_labels_skipped_by_pairing_count": len(paragraph_labels_skipped_by_pairing),
         "figure_caption_seq_added": figure_seq_added,
         "table_caption_seq_added": table_seq_added,
         "equation_seq_added": equation_seq_added,
@@ -2694,10 +3048,12 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "bookmark_added_figure": bookmark_added_figure,
         "bookmark_added_table": bookmark_added_table,
         "bookmark_added_equation": bookmark_added_equation,
+        "bookmark_added_paragraph": bookmark_added_paragraph,
         "bookmark_added_fuzzy": bookmark_added_fuzzy,
         "figure_num_bookmark_added": figure_num_bookmark_added,
         "table_num_bookmark_added": table_num_bookmark_added,
         "equation_num_bookmark_added": equation_num_bookmark_added,
+        "paragraph_num_bookmark_added": paragraph_num_bookmark_added,
         "figure_ref_mapping_anchor_count": len(figure_ref_mapping),
         "figure_ref_candidate_link_count": figure_ref_candidate_links,
         "figure_ref_candidate_anchor_count": figure_ref_candidate_anchor_count,
@@ -2719,6 +3075,11 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "equation_ref_candidate_anchor_count": equation_ref_candidate_anchor_count,
         "equation_ref_converted_link_count": equation_ref_converted,
         "equation_ref_unmapped_anchor_count": len(equation_anchor_unmapped),
+        "paragraph_ref_mapping_anchor_count": len(paragraph_ref_mapping),
+        "paragraph_ref_candidate_link_count": paragraph_ref_candidate_links,
+        "paragraph_ref_candidate_anchor_count": paragraph_ref_candidate_anchor_count,
+        "paragraph_ref_converted_link_count": paragraph_ref_converted,
+        "paragraph_ref_unmapped_anchor_count": len(paragraph_anchor_unmapped),
         "missing_anchor_count_after": len(missing_anchors),
     }
 
@@ -2729,6 +3090,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_labels_repaired": figure_label_repaired,
         "table_labels_repaired": table_label_repaired,
         "equation_labels_repaired": equation_label_repaired,
+        "paragraph_labels_repaired": paragraph_label_repaired,
         "equation_display_style_id": mt_display_equation_style_id,
         "figure_labels_bound_to_ref_bookmark": figure_labels_bound,
         "figure_labels_missing_number_bookmark": figure_labels_missing_num,
@@ -2756,8 +3118,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "table_labels_missing_number_bookmark": table_labels_missing_num,
         "equation_labels_bound_to_ref_bookmark": equation_labels_bound,
         "equation_labels_missing_number_bookmark": equation_labels_missing_num,
+        "paragraph_labels_bound_to_heading_bookmark": paragraph_labels_bound,
+        "paragraph_labels_missing_heading_bookmark": paragraph_labels_missing_bookmark,
+        "paragraph_num_bookmark_added": paragraph_num_bookmark_added,
         "equation_pairing_strategy": equation_pairing_strategy,
         "equation_pairing_warnings": equation_pairing_warnings[:20],
+        "paragraph_pairing_strategy": paragraph_pairing_strategy,
+        "paragraph_pairing_warnings": paragraph_pairing_warnings[:20],
+        "paragraph_labels_skipped_by_pairing": paragraph_labels_skipped_by_pairing[:50],
         "equation_alias_group_count": len(equation_aliases_by_primary),
         "equation_slot_unlabeled_count": sum(
             1
@@ -2774,6 +3142,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "subfigure_ref_unmapped_anchors": subfigure_anchor_unmapped[:50],
         "table_ref_unmapped_anchors": table_anchor_unmapped[:50],
         "equation_ref_unmapped_anchors": equation_anchor_unmapped[:50],
+        "paragraph_ref_unmapped_anchors": paragraph_anchor_unmapped[:50],
         "fuzzy_anchor_repairs": fuzzy_records,
         "missing_anchors_sample_after": sorted(missing_anchors)[:50],
     }
@@ -2806,6 +3175,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "equation 标签数量大于 docx 可识别显示公式段落数量，部分公式书签无法自动修复。"
         )
+    if len(paragraph_labels) > len(heading_paragraphs):
+        warnings.append(
+            "段落标签数量大于 docx 可识别标题段落数量，部分段落书签无法自动修复。"
+        )
     if display_equation_paragraphs and not mt_display_equation_style_id:
         warnings.append(
             "未在 reference.docx 中检测到 MTDisplayEquation 样式；显示公式段落保持原样式。"
@@ -2826,6 +3199,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             f"{len(equation_labels_missing_num)} 个 equation 标签未能绑定公式号书签，相关公式引用无法升级为 REF 字段。"
         )
+    if paragraph_labels_missing_bookmark:
+        warnings.append(
+            f"{len(paragraph_labels_missing_bookmark)} 个段落标签未能绑定标题书签，相关段落引用无法升级为编号 REF 字段。"
+        )
     if figure_ref_candidate_links > 0 and figure_ref_converted < figure_ref_candidate_links:
         warnings.append(
             "部分 figure 超链接未成功转换为 REF 字段，请人工核对图引用。"
@@ -2842,6 +3219,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         warnings.append(
             "部分 equation 超链接未成功转换为 REF 字段，请人工核对公式引用。"
         )
+    if paragraph_ref_candidate_links > 0 and paragraph_ref_converted < paragraph_ref_candidate_links:
+        warnings.append(
+            "部分段落超链接未成功转换为编号 REF 字段，请人工核对章节引用。"
+        )
+    if paragraph_labels_skipped_by_pairing:
+        warnings.append(
+            f"段落槽位配对中跳过 {len(paragraph_labels_skipped_by_pairing)} 个标签，相关章节引用可能需要人工核对。"
+        )
     if figure_anchor_unmapped:
         warnings.append(
             f"检测到 {len(figure_anchor_unmapped)} 个 figure 风格锚点未映射到图题，已保留原超链接。"
@@ -2857,6 +3242,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     if equation_anchor_unmapped:
         warnings.append(
             f"检测到 {len(equation_anchor_unmapped)} 个 equation 风格锚点未映射到公式编号，已保留原超链接。"
+        )
+    if paragraph_anchor_unmapped:
+        warnings.append(
+            f"检测到 {len(paragraph_anchor_unmapped)} 个段落风格锚点未映射到标题编号，已保留原超链接。"
         )
     if missing_anchors:
         warnings.append(
