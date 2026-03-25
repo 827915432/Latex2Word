@@ -916,6 +916,64 @@ def append_dedup(items: list[ChecklistItem], seen: set[tuple[str, str, str, str]
         seen.add(key)
 
 
+def shorten_for_line(text: str, limit: int = 80) -> str:
+    """
+    截断单行文本，避免清单项过长。
+    """
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3].rstrip() + "..."
+
+
+def format_unrenderable_image_examples(details: dict, limit: int = 8) -> list[str]:
+    """
+    从 finding details 中提取“不可渲染图片”对象摘要。
+    """
+    raw_examples = details.get("unsupported_image_examples", [])
+    if not isinstance(raw_examples, list):
+        return []
+
+    summaries: list[str] = []
+    for raw in raw_examples:
+        if not isinstance(raw, dict):
+            continue
+        source_hint = shorten_for_line(str(raw.get("source_hint", "")).strip(), 70)
+        target = shorten_for_line(str(raw.get("target", "")).strip(), 70)
+        paragraph_text = shorten_for_line(str(raw.get("paragraph_text", "")).strip(), 45)
+        next_paragraph_text = shorten_for_line(str(raw.get("next_paragraph_text", "")).strip(), 45)
+        rid = str(raw.get("rid", "")).strip()
+        paragraph_index = raw.get("paragraph_index")
+
+        generic_hints = {"picture", "image", "图", "图片"}
+        source_lower = source_hint.lower()
+        source_is_generic = source_lower in generic_hints or source_lower.startswith("picture ")
+
+        context_hint = next_paragraph_text or paragraph_text
+        meaningful_source = "" if source_is_generic else source_hint
+        anchor = meaningful_source or context_hint or target or rid
+        if not anchor:
+            continue
+
+        location_parts: list[str] = []
+        if rid:
+            location_parts.append(f"rId={rid}")
+        if paragraph_index:
+            location_parts.append(f"段落#{paragraph_index}")
+        location_text = f" ({', '.join(location_parts)})" if location_parts else ""
+
+        if target and target != anchor:
+            summaries.append(f"{anchor} -> {target}{location_text}")
+        else:
+            summaries.append(f"{anchor}{location_text}")
+        if len(summaries) >= limit:
+            break
+
+    return summaries
+
+
 # -----------------------------------------------------------------------------
 # 从各阶段报告映射为人工修复项
 # -----------------------------------------------------------------------------
@@ -1309,6 +1367,49 @@ def items_from_postcheck(postcheck_report: Optional[dict]) -> list[ChecklistItem
                         "若标题被转成普通段落，请将关键章节标题恢复为正确的 Word 标题样式。",
                         "恢复标题样式后重新更新目录与字段。",
                     ],
+                    affects_delivery=DELIVERY_HIGH,
+                    details=details,
+                )
+            )
+            seq += 1
+
+        elif code == "UNRENDERABLE_IMAGE_FORMATS_DETECTED":
+            unsupported_formats = details.get("unsupported_formats", [])
+            if not isinstance(unsupported_formats, list):
+                unsupported_formats = []
+            format_text = ", ".join(str(item) for item in unsupported_formats if str(item).strip()) or "PDF/EPS"
+
+            unsupported_ref_count = int(details.get("unsupported_reference_count_in_body", 0) or 0)
+            unsupported_examples = format_unrenderable_image_examples(details, limit=8)
+            example_text = "；".join(unsupported_examples)
+
+            issue_summary = (
+                f"后检查发现 {unsupported_ref_count} 处图片引用关联到 {format_text}，"
+                "Word 通常不会渲染这类内嵌图片。"
+            )
+            if example_text:
+                issue_summary += f" 已定位对象：{example_text}"
+
+            recommended_actions = [
+                "根据清单中的对象定位到源图，优先将 PDF/EPS 转为 PNG/JPG/EMF 等可渲染格式。",
+                "替换后重新运行 convert -> postcheck -> checklist，确认该告警已消失。",
+                "若暂时不能回源替换，请在 Word 中手工重插对应图片并复核题注与文内引用。",
+            ]
+            if unsupported_examples:
+                recommended_actions.append(f"优先处理这些对象：{'; '.join(unsupported_examples)}")
+
+            items.append(
+                make_item(
+                    item_id=f"D{seq:02d}",
+                    priority=85,
+                    category="images",
+                    title="处理 Word 不可渲染的 PDF/EPS 图片",
+                    source_stage="postcheck",
+                    source_code=code,
+                    location=location,
+                    issue_summary=issue_summary,
+                    why_it_matters="这类图片在 Word 中往往直接空白，属于用户可见的高风险缺陷，必须人工收口。",
+                    recommended_actions=recommended_actions,
                     affects_delivery=DELIVERY_HIGH,
                     details=details,
                 )

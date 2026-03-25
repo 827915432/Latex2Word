@@ -58,7 +58,7 @@ import sys
 import zipfile
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 from xml.etree import ElementTree as ET
 
@@ -101,8 +101,13 @@ NS = {
     "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
     "v": "urn:schemas-microsoft-com:vml",
 }
+
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+UNRENDERABLE_IMAGE_EXTENSIONS = {".pdf", ".eps"}
+UNRENDERABLE_IMAGE_EXAMPLE_LIMIT = 80
 
 # -----------------------------------------------------------------------------
 # 数据结构定义
@@ -367,6 +372,86 @@ def parse_xml_from_zip(docx_zip: zipfile.ZipFile, member_name: str) -> Optional[
         return None
 
 
+def get_relationship_attr(rel: ET.Element, name: str) -> str:
+    """
+    获取 relationships 节点属性，兼容带命名空间与不带命名空间两种写法。
+    """
+    return rel.attrib.get(f"{{{PACKAGE_REL_NS}}}{name}", rel.attrib.get(name, ""))
+
+
+def normalize_relationship_target(target: str, owner_part: str = "word/document.xml") -> str:
+    """
+    将 relationship Target 规范化为 docx 包内路径。
+
+    例如：
+    - "media/image1.png" -> "word/media/image1.png"
+    - "../media/image1.png" -> "media/image1.png"
+    - "/word/media/image1.png" -> "word/media/image1.png"
+    """
+    raw = (target or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+
+    # 去掉 query / fragment，避免扩展名提取误判。
+    raw = raw.split("#", 1)[0].split("?", 1)[0]
+
+    if raw.startswith("/"):
+        base_parts: list[str] = []
+        parts = raw.lstrip("/").split("/")
+    else:
+        owner_parts = [segment for segment in owner_part.replace("\\", "/").split("/") if segment]
+        base_parts = owner_parts[:-1]
+        parts = raw.split("/")
+
+    for part in parts:
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if base_parts:
+                base_parts.pop()
+            continue
+        base_parts.append(part)
+
+    return "/".join(base_parts)
+
+
+def file_extension_lower(path_like: str) -> str:
+    """
+    提取路径扩展名并归一化为小写。
+    """
+    cleaned = (path_like or "").split("#", 1)[0].split("?", 1)[0].strip()
+    if not cleaned:
+        return ""
+    return PurePosixPath(cleaned).suffix.lower()
+
+
+def shorten_text(text: str, limit: int = 120) -> str:
+    """
+    截断文本，避免报告细节过长。
+    """
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3].rstrip() + "..."
+
+
+def dedup_keep_order(values: list[str]) -> list[str]:
+    """
+    简单去重并保持原顺序。
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
+
+
 def get_style_maps(styles_root: Optional[ET.Element]) -> tuple[dict[str, str], set[str], set[str]]:
     """
     从 word/styles.xml 构造样式映射与关键样式集合。
@@ -522,6 +607,95 @@ def paragraph_contains_image(paragraph: ET.Element) -> bool:
     return bool(paragraph.findall(".//a:blip[@r:embed]", NS) or paragraph.findall(".//v:imagedata[@r:id]", NS))
 
 
+def get_next_nonempty_paragraph_text(
+    body_children: list[ET.Element],
+    start_child_idx: int,
+    child_idx_to_para_idx: dict[int, int],
+    paragraph_texts: list[str],
+) -> str:
+    """
+    获取当前块后第一个非空段落文本。
+    """
+    for next_idx in range(start_child_idx + 1, len(body_children)):
+        next_child = body_children[next_idx]
+        if next_child.tag != f"{{{NS['w']}}}p":
+            continue
+        para_idx = child_idx_to_para_idx.get(next_idx)
+        if para_idx is None:
+            continue
+        text = paragraph_texts[para_idx].strip()
+        if text:
+            return text
+    return ""
+
+
+def collect_image_occurrences_in_body(
+    body_children: list[ET.Element],
+    child_idx_to_para_idx: dict[int, int],
+    paragraph_texts: list[str],
+) -> list[dict]:
+    """
+    收集正文中图片引用的出现位置及上下文线索。
+    """
+    occurrences: list[dict] = []
+
+    for child_idx, child in enumerate(body_children):
+        if child.tag != f"{{{NS['w']}}}p":
+            continue
+        para_idx = child_idx_to_para_idx.get(child_idx)
+        if para_idx is None:
+            continue
+
+        paragraph_text = shorten_text(paragraph_texts[para_idx], limit=120)
+        next_text = shorten_text(
+            get_next_nonempty_paragraph_text(
+                body_children=body_children,
+                start_child_idx=child_idx,
+                child_idx_to_para_idx=child_idx_to_para_idx,
+                paragraph_texts=paragraph_texts,
+            ),
+            limit=120,
+        )
+
+        source_hints = dedup_keep_order(
+            [
+                (node.get("descr") or node.get("title") or node.get("name") or "").strip()
+                for node in child.findall(".//wp:docPr", NS)
+            ]
+        )
+        source_hint = source_hints[0] if source_hints else ""
+
+        for blip in child.findall(".//a:blip[@r:embed]", NS):
+            rid = blip.attrib.get(f"{{{NS['r']}}}embed", "").strip()
+            if rid:
+                occurrences.append(
+                    {
+                        "rid": rid,
+                        "ref_kind": "drawingml",
+                        "paragraph_index": para_idx + 1,
+                        "paragraph_text": paragraph_text,
+                        "next_paragraph_text": next_text,
+                        "source_hint": source_hint,
+                    }
+                )
+
+        for imagedata in child.findall(".//v:imagedata[@r:id]", NS):
+            rid = imagedata.attrib.get(f"{{{NS['r']}}}id", "").strip()
+            if rid:
+                occurrences.append(
+                    {
+                        "rid": rid,
+                        "ref_kind": "vml",
+                        "paragraph_index": para_idx + 1,
+                        "paragraph_text": paragraph_text,
+                        "next_paragraph_text": next_text,
+                        "source_hint": source_hint,
+                    }
+                )
+
+    return occurrences
+
+
 def is_likely_proximity_caption_text(text: str) -> bool:
     """
     判断“图/表后紧邻段落文本”是否像题注。
@@ -608,6 +782,10 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
         "has_document_xml": False,
         "media_file_count": 0,
         "image_reference_count_in_body": 0,
+        "image_relationship_count": 0,
+        "unsupported_image_relationship_count": 0,
+        "unsupported_image_reference_count_in_body": 0,
+        "unsupported_image_format_count": 0,
         "table_count": 0,
         "paragraph_count": 0,
         "heading_count": 0,
@@ -677,12 +855,23 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
             style_id_to_name, heading_style_ids, caption_style_ids = get_style_maps(styles_root)
 
             rels_root = parse_xml_from_zip(docx_zip, "word/_rels/document.xml.rels")
+            image_relationships: dict[str, dict] = {}
             if rels_root is not None:
-                relationship_type_attr = "{http://schemas.openxmlformats.org/package/2006/relationships}Type"
                 for rel in rels_root.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
-                    rel_type = rel.attrib.get(relationship_type_attr, "")
+                    rel_type = get_relationship_attr(rel, "Type")
+                    rel_id = get_relationship_attr(rel, "Id")
+                    rel_target = get_relationship_attr(rel, "Target")
                     if rel_type.endswith("/hyperlink"):
                         inventory["external_hyperlink_relation_count"] += 1
+                    elif rel_type.endswith("/image") and rel_id:
+                        resolved_target = normalize_relationship_target(rel_target)
+                        image_relationships[rel_id] = {
+                            "rid": rel_id,
+                            "target": rel_target,
+                            "resolved_target": resolved_target,
+                            "extension": file_extension_lower(resolved_target),
+                        }
+            inventory["image_relationship_count"] = len(image_relationships)
 
             document_root = parse_xml_from_zip(docx_zip, "word/document.xml")
             if document_root is None:
@@ -802,6 +991,70 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
                         inventory["table_caption_count"] += 1
                     else:
                         inventory["unknown_caption_count"] += 1
+
+            # 统计正文中图片引用与关系映射，识别 Word 常见不可渲染格式（PDF/EPS）。
+            image_occurrences = collect_image_occurrences_in_body(
+                body_children=body_children,
+                child_idx_to_para_idx=child_idx_to_para_idx,
+                paragraph_texts=paragraph_texts,
+            )
+            unsupported_ref_count = 0
+            unsupported_rids: set[str] = set()
+            unsupported_format_counter: Counter[str] = Counter()
+            unsupported_examples: list[dict] = []
+
+            for occurrence in image_occurrences:
+                rel = image_relationships.get(occurrence["rid"])
+                if not rel:
+                    continue
+
+                ext = (rel.get("extension") or "").lower()
+                if ext not in UNRENDERABLE_IMAGE_EXTENSIONS:
+                    continue
+
+                unsupported_ref_count += 1
+                unsupported_rids.add(occurrence["rid"])
+                unsupported_format_counter[ext] += 1
+
+                if len(unsupported_examples) < UNRENDERABLE_IMAGE_EXAMPLE_LIMIT:
+                    unsupported_examples.append(
+                        {
+                            "rid": occurrence["rid"],
+                            "format": ext,
+                            "target": rel.get("resolved_target") or rel.get("target"),
+                            "source_hint": occurrence.get("source_hint") or rel.get("resolved_target") or rel.get("target"),
+                            "paragraph_index": occurrence.get("paragraph_index"),
+                            "paragraph_text": occurrence.get("paragraph_text"),
+                            "next_paragraph_text": occurrence.get("next_paragraph_text"),
+                        }
+                    )
+
+            inventory["unsupported_image_relationship_count"] = len(unsupported_rids)
+            inventory["unsupported_image_reference_count_in_body"] = unsupported_ref_count
+            inventory["unsupported_image_format_count"] = len(unsupported_format_counter)
+
+            if unsupported_ref_count > 0:
+                unsupported_formats = sorted(unsupported_format_counter.keys())
+                findings.append(
+                    Finding(
+                        severity=SEVERITY_WARN,
+                        code="UNRENDERABLE_IMAGE_FORMATS_DETECTED",
+                        message=(
+                            "检测到正文图片引用关联了 PDF/EPS 媒体资源；"
+                            "Word 通常不渲染这类内嵌图片，需人工替换为可渲染格式。"
+                        ),
+                        location="word/_rels/document.xml.rels -> word/media",
+                        details={
+                            "unsupported_formats": unsupported_formats,
+                            "unsupported_reference_count_in_body": unsupported_ref_count,
+                            "unsupported_relationship_count": len(unsupported_rids),
+                            "unsupported_reference_count_by_format": dict(sorted(unsupported_format_counter.items())),
+                            "unsupported_image_examples": unsupported_examples,
+                            "example_count": len(unsupported_examples),
+                            "example_truncated": unsupported_ref_count > len(unsupported_examples),
+                        },
+                    )
+                )
 
             # 结构邻近检测（图/表后紧邻段落）：
             # 当段落样式和前缀都没命中 caption 时，邻近结构可以补充识别。
@@ -1372,6 +1625,9 @@ def analyze_results(
     if expected_table_count > 0:
         recommendations.append("重点核对复杂表格的单元格合并、跨页与版式。")
 
+    if docx_inventory.get("unsupported_image_reference_count_in_body", 0) > 0:
+        recommendations.append("将检测到的 PDF/EPS 图片替换为 PNG/JPG/EMF 等 Word 可渲染格式后再复核。")
+
     if expected_equation_count > 0:
         recommendations.append("重点核对复杂公式是否仍为 Word 数学对象，以及公式编号是否正确。")
 
@@ -1400,6 +1656,9 @@ def analyze_results(
         "expected_ref_count": expected_ref_count,
         "expected_cite_count": expected_cite_count,
         "actual_image_reference_count_in_body": docx_inventory.get("image_reference_count_in_body", 0),
+        "actual_image_relationship_count": docx_inventory.get("image_relationship_count", 0),
+        "actual_unsupported_image_relationship_count": docx_inventory.get("unsupported_image_relationship_count", 0),
+        "actual_unsupported_image_reference_count_in_body": docx_inventory.get("unsupported_image_reference_count_in_body", 0),
         "actual_table_count": docx_inventory.get("table_count", 0),
         "actual_heading_count": docx_inventory.get("heading_count", 0),
         "actual_math_object_count": docx_inventory.get("math_object_count", 0),
