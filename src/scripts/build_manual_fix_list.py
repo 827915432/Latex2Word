@@ -63,6 +63,8 @@ python scripts/build_manual_fix_list.py --work-root D:/work/my-paper__latex_to_w
 from __future__ import annotations
 
 import argparse
+import datetime
+import re
 import shutil
 import sys
 from dataclasses import asdict, dataclass, field
@@ -204,8 +206,11 @@ class ManualFixChecklistReport:
     """
     status: str
     can_continue: bool
+    generated_at: str
     work_root: str
     source_project_root: Optional[str]
+    main_tex: Optional[str]
+    output_docx: Optional[str]
     used_precheck_report: bool
     used_normalization_report: bool
     used_conversion_report: bool
@@ -217,6 +222,29 @@ class ManualFixChecklistReport:
     user_view_generated: bool
     user_view_root: Optional[str]
     published_file_count: int
+
+
+@dataclass
+class TextHit:
+    """
+    TeX 文本命中位置。
+    """
+    file: str
+    line: int
+    snippet: str
+
+
+@dataclass
+class TexIndex:
+    """
+    TeX 索引：用于给 checklist 提供“可直接定位”的源位置信息。
+    """
+    labels: dict[str, list[TextHit]] = field(default_factory=dict)
+    refs: dict[str, list[TextHit]] = field(default_factory=dict)
+    cites: dict[str, list[TextHit]] = field(default_factory=dict)
+    headings_by_file: dict[str, list[TextHit]] = field(default_factory=dict)
+    lines_by_file: dict[str, list[str]] = field(default_factory=dict)
+    root: Optional[Path] = None
 
 
 # -----------------------------------------------------------------------------
@@ -975,6 +1003,516 @@ def format_unrenderable_image_examples(details: dict, limit: int = 8) -> list[st
 
 
 # -----------------------------------------------------------------------------
+# 定位与用户视图增强
+# -----------------------------------------------------------------------------
+
+LABEL_RE = re.compile(r"\\label\{([^{}]+)\}")
+REF_RE = re.compile(r"\\(?:ref|eqref|autoref|cref|Cref|pageref|nameref|vref|Vref)\{([^{}]+)\}")
+CITE_RE = re.compile(r"\\cite[a-zA-Z*]*\s*(?:\[[^\]]*\]\s*){0,2}\{([^{}]+)\}")
+HEADING_RE = re.compile(r"\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\{([^{}]+)\}")
+
+
+def _strip_tex_comment(line: str) -> str:
+    """
+    去掉 TeX 行注释（保留被转义的 %）。
+    """
+    escaped = False
+    for idx, ch in enumerate(line):
+        if ch == "\\":
+            escaped = not escaped
+            continue
+        if ch == "%" and not escaped:
+            return line[:idx]
+        escaped = False
+    return line
+
+
+def _push_hit(bucket: dict[str, list[TextHit]], key: str, hit: TextHit) -> None:
+    value = key.strip()
+    if not value:
+        return
+    bucket.setdefault(value, []).append(hit)
+
+
+def build_tex_index(tex_root: Optional[Path]) -> TexIndex:
+    """
+    构建 TeX 索引，用于把锚点映射到 `file:line`。
+    """
+    index = TexIndex(root=tex_root.resolve() if tex_root and tex_root.exists() else None)
+    if tex_root is None or not tex_root.exists():
+        return index
+
+    tex_files = sorted(path for path in tex_root.rglob("*.tex") if path.is_file())
+    for tex_path in tex_files:
+        rel_path = tex_path.relative_to(tex_root).as_posix()
+        try:
+            lines = tex_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+
+        index.lines_by_file[rel_path] = lines
+        for line_no, raw_line in enumerate(lines, start=1):
+            line = _strip_tex_comment(raw_line)
+            line_snippet = shorten_for_line(line.strip(), 120)
+            if not line_snippet:
+                continue
+
+            heading_match = HEADING_RE.search(line)
+            if heading_match:
+                title = heading_match.group(2).strip()
+                index.headings_by_file.setdefault(rel_path, []).append(
+                    TextHit(file=rel_path, line=line_no, snippet=title)
+                )
+
+            for match in LABEL_RE.finditer(line):
+                label = match.group(1).strip()
+                _push_hit(index.labels, label, TextHit(file=rel_path, line=line_no, snippet=line_snippet))
+
+            for match in REF_RE.finditer(line):
+                refs_raw = match.group(1).strip()
+                for key in refs_raw.split(","):
+                    ref_label = key.strip()
+                    if ref_label:
+                        _push_hit(index.refs, ref_label, TextHit(file=rel_path, line=line_no, snippet=line_snippet))
+
+            for match in CITE_RE.finditer(line):
+                cites_raw = match.group(1).strip()
+                for key in cites_raw.split(","):
+                    cite_key = key.strip()
+                    if cite_key:
+                        _push_hit(index.cites, cite_key, TextHit(file=rel_path, line=line_no, snippet=line_snippet))
+
+    return index
+
+
+def _find_heading_for_hit(index: TexIndex, hit: Optional[TextHit]) -> Optional[str]:
+    if hit is None:
+        return None
+    headings = index.headings_by_file.get(hit.file, [])
+    if not headings:
+        return None
+    selected: Optional[TextHit] = None
+    for heading in headings:
+        if heading.line <= hit.line:
+            selected = heading
+        else:
+            break
+    if selected is None:
+        return None
+    return shorten_for_line(selected.snippet, 42)
+
+
+def _best_source_hit(index: TexIndex, anchor: str) -> Optional[TextHit]:
+    """
+    以 label > cite > ref 的顺序选源定位。
+    """
+    if anchor in index.labels and index.labels[anchor]:
+        return index.labels[anchor][0]
+    if anchor in index.cites and index.cites[anchor]:
+        return index.cites[anchor][0]
+    if anchor in index.refs and index.refs[anchor]:
+        return index.refs[anchor][0]
+    return None
+
+
+def _best_ref_hit(index: TexIndex, anchor: str) -> Optional[TextHit]:
+    if anchor in index.refs and index.refs[anchor]:
+        return index.refs[anchor][0]
+    return None
+
+
+def _normalize_for_search(text: str) -> str:
+    lowered = (text or "").lower()
+    return re.sub(r"[\s\\{}()\[\],.:;，。；：“”‘’\"'`~!@#$%^&*+=<>/?|-]+", "", lowered)
+
+
+def _find_source_line_by_evidence(index: TexIndex, evidence_text: str) -> Optional[TextHit]:
+    """
+    通过短证据文本在 TeX 中反查行号（用于图片 caption 等弱锚点场景）。
+    """
+    target = _normalize_for_search(evidence_text)
+    if len(target) < 4:
+        return None
+
+    candidates: list[str] = [target]
+    stripped = re.sub(r"^(图|表|式)\d+(\.\d+)*", "", target)
+    stripped = stripped.strip()
+    if stripped and stripped not in candidates:
+        candidates.append(stripped)
+    if len(target) > 6:
+        tail = target[2:]
+        if tail and tail not in candidates:
+            candidates.append(tail)
+
+    for file_path, lines in index.lines_by_file.items():
+        for i, raw_line in enumerate(lines, start=1):
+            line = _normalize_for_search(_strip_tex_comment(raw_line))
+            if not line:
+                continue
+            hit = False
+            for candidate in candidates:
+                prefix = candidate[: min(14, len(candidate))]
+                if prefix in line or candidate in line:
+                    hit = True
+                    break
+            if hit:
+                snippet = shorten_for_line(_strip_tex_comment(raw_line).strip(), 120)
+                if snippet:
+                    return TextHit(file=file_path, line=i, snippet=snippet)
+    return None
+
+
+def _extract_anchor_candidates(item: dict) -> list[str]:
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    source_code = str(item.get("source_code", "")).strip()
+    anchors: list[str] = []
+
+    def push(value: Optional[str]) -> None:
+        if not value:
+            return
+        v = str(value).strip()
+        if v and v not in anchors:
+            anchors.append(v)
+
+    for key in ["label", "key", "rid", "target", "macro_name"]:
+        value = details.get(key)
+        if isinstance(value, str):
+            push(value)
+
+    environments = details.get("environments")
+    if isinstance(environments, dict):
+        for env_name in environments.keys():
+            if isinstance(env_name, str):
+                push(env_name)
+                break
+
+    unknown_envs = details.get("unknown_environments")
+    if isinstance(unknown_envs, dict):
+        for env_name in unknown_envs.keys():
+            if isinstance(env_name, str):
+                push(env_name)
+                break
+
+    custom_envs = details.get("custom_environments")
+    if isinstance(custom_envs, dict):
+        for env_name in custom_envs.keys():
+            if isinstance(env_name, str):
+                push(env_name)
+                break
+
+    for key in ["anchors", "equation_ref_unmapped_anchors", "table_ref_unmapped_anchors", "figure_ref_unmapped_anchors"]:
+        value = details.get(key)
+        if isinstance(value, list):
+            for anchor in value:
+                if isinstance(anchor, str):
+                    push(anchor)
+
+    locations = details.get("locations")
+    if isinstance(locations, list):
+        label = details.get("label")
+        if isinstance(label, str):
+            push(label)
+
+    unsupported_examples = details.get("unsupported_image_examples")
+    if isinstance(unsupported_examples, list) and unsupported_examples:
+        first = unsupported_examples[0]
+        if isinstance(first, dict):
+            push(first.get("rid"))
+            push(first.get("target"))
+
+    if not anchors:
+        if source_code == "CUSTOM_COMMANDS_DETECTED":
+            push("\\newcommand")
+        elif source_code == "CONDITIONAL_COMPILATION_DETECTED":
+            push("\\if")
+
+    if not anchors:
+        warning_text = details.get("warning_text")
+        if isinstance(warning_text, str):
+            strategy = re.search(r"[\(（]([A-Za-z0-9._:-]{3,40})[\)）]", warning_text)
+            if strategy:
+                push(strategy.group(1))
+
+    if not anchors:
+        location = item.get("location")
+        if isinstance(location, str):
+            rel_match = re.search(r"(rId\d+)", location, re.IGNORECASE)
+            if rel_match:
+                push(rel_match.group(1))
+
+    if not anchors:
+        push(source_code)
+
+    return anchors
+
+
+def _infer_source_hit(item: dict, index: TexIndex, main_tex: Optional[str], anchor: str) -> tuple[Optional[TextHit], bool]:
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    location = item.get("location")
+
+    locations = details.get("locations")
+    if isinstance(locations, list) and locations:
+        first = locations[0]
+        if isinstance(first, dict):
+            file_path = str(first.get("file", "")).strip()
+            line_no = first.get("line")
+            if file_path and isinstance(line_no, int):
+                snippet = ""
+                lines = index.lines_by_file.get(file_path)
+                if isinstance(lines, list) and 1 <= line_no <= len(lines):
+                    snippet = shorten_for_line(_strip_tex_comment(lines[line_no - 1]).strip(), 120)
+                return TextHit(file=file_path, line=line_no, snippet=snippet), True
+
+    if isinstance(details.get("source_line"), int):
+        line_no = int(details["source_line"])
+        if isinstance(location, str) and location.strip():
+            file_path = location.replace("\\", "/").strip()
+            return TextHit(file=file_path, line=line_no, snippet=""), True
+
+    hit = _best_source_hit(index, anchor)
+    if hit is not None:
+        return hit, True
+
+    anchor_hit = _find_source_line_by_evidence(index, anchor)
+    if anchor_hit is not None:
+        return anchor_hit, True
+
+    source_code = str(item.get("source_code", "")).strip()
+    if source_code == "CONDITIONAL_COMPILATION_DETECTED":
+        pattern = re.compile(r"\\if[a-zA-Z]*")
+        for file_path, lines in index.lines_by_file.items():
+            for i, raw_line in enumerate(lines, start=1):
+                line = _strip_tex_comment(raw_line)
+                if pattern.search(line):
+                    snippet = shorten_for_line(line.strip(), 120)
+                    if snippet:
+                        return TextHit(file=file_path, line=i, snippet=snippet), True
+
+    unsupported_examples = details.get("unsupported_image_examples")
+    if isinstance(unsupported_examples, list) and unsupported_examples:
+        first = unsupported_examples[0]
+        if isinstance(first, dict):
+            hint = str(first.get("next_paragraph_text", "") or first.get("paragraph_text", "")).strip()
+            if hint:
+                hint_hit = _find_source_line_by_evidence(index, hint)
+                if hint_hit is not None:
+                    return hint_hit, True
+
+    if isinstance(location, str) and location.endswith(".tex"):
+        return TextHit(file=location.replace("\\", "/"), line=1, snippet=""), False
+
+    if main_tex:
+        return TextHit(file=main_tex, line=1, snippet=""), False
+    return None, False
+
+
+def _infer_word_location(item: dict, source_hit: Optional[TextHit], heading: Optional[str]) -> str:
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    location = item.get("location")
+
+    unsupported_examples = details.get("unsupported_image_examples")
+    if isinstance(unsupported_examples, list) and unsupported_examples:
+        first = unsupported_examples[0]
+        if isinstance(first, dict):
+            para_idx = first.get("paragraph_index")
+            para_hint = str(first.get("next_paragraph_text", "") or first.get("paragraph_text", "")).strip()
+            para_hint = shorten_for_line(para_hint, 28)
+            word_parts: list[str] = []
+            if heading:
+                word_parts.append(f"§{heading}")
+            if isinstance(para_idx, int):
+                word_parts.append(f"para#{para_idx}")
+            if para_hint:
+                word_parts.append(para_hint)
+            if word_parts:
+                return " | ".join(word_parts)
+
+    if isinstance(location, str) and location.startswith("word/"):
+        if heading:
+            return f"§{heading} | {location}"
+        return location
+
+    if heading:
+        return f"§{heading}"
+
+    if source_hit is not None:
+        return f"{source_hit.file}:{source_hit.line}"
+
+    return "N/A"
+
+
+def _infer_evidence(item: dict, source_hit: Optional[TextHit], anchor: str) -> str:
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+
+    unsupported_examples = details.get("unsupported_image_examples")
+    if isinstance(unsupported_examples, list) and unsupported_examples:
+        first = unsupported_examples[0]
+        if isinstance(first, dict):
+            target = str(first.get("target", "")).strip()
+            next_text = str(first.get("next_paragraph_text", "")).strip()
+            evidence = target or next_text
+            if evidence:
+                return shorten_for_line(evidence, 40)
+
+    if source_hit is not None and source_hit.snippet:
+        return shorten_for_line(source_hit.snippet, 40)
+
+    warning_text = details.get("warning_text")
+    if isinstance(warning_text, str) and warning_text.strip():
+        return shorten_for_line(warning_text, 40)
+
+    issue = item.get("issue_summary")
+    if isinstance(issue, str) and issue.strip():
+        return shorten_for_line(issue, 40)
+
+    return shorten_for_line(anchor, 40)
+
+
+def build_primary_location(item: dict, index: TexIndex, main_tex: Optional[str]) -> dict[str, str]:
+    """
+    输出统一定位模板字段：
+    Source / Word / Anchor / Evidence
+    """
+    anchors = _extract_anchor_candidates(item)
+    anchor = anchors[0] if anchors else "N/A"
+    source_hit, source_exact = _infer_source_hit(item, index, main_tex, anchor)
+    heading = _find_heading_for_hit(index, source_hit) if source_hit is not None else None
+    word_location = _infer_word_location(item, source_hit, heading)
+    evidence = _infer_evidence(item, source_hit, anchor)
+    source_code = str(item.get("source_code", "")).strip()
+    anchor_exact = bool(anchor) and anchor not in {"N/A", source_code}
+
+    if source_hit is not None:
+        source_text = f"{source_hit.file}:{source_hit.line}"
+    else:
+        source_text = f"{main_tex}:1" if main_tex else "N/A"
+
+    return {
+        "source": source_text,
+        "word": word_location,
+        "anchor": anchor or "N/A",
+        "evidence": evidence,
+        "source_quality": "exact" if source_exact else "fallback",
+        "anchor_quality": "exact" if anchor_exact else "fallback",
+    }
+
+
+def format_primary_location(location: dict[str, str]) -> str:
+    source = location.get("source", "N/A")
+    word = location.get("word", "N/A")
+    anchor = location.get("anchor", "N/A")
+    evidence = location.get("evidence", "")
+    return f"Source={source}; Word={word}; Anchor={anchor}; Evidence=\"{evidence}\""
+
+
+def derive_fix_action(item: dict) -> str:
+    """
+    只输出一条主修复路径，避免“多方案噪音”。
+    """
+    source_code = str(item.get("source_code", "")).strip()
+    category = str(item.get("category", "")).strip()
+
+    fixed_actions = {
+        "DUPLICATE_LABEL": "修改重复的 \\label 为唯一键，并同步相关 \\ref。 ",
+        "UNDEFINED_LABEL_REFERENCE": "补齐缺失 \\label 或修正 \\ref 的目标键。",
+        "UNDEFINED_CITATION_KEY": "修正 \\cite 键并补齐对应 .bib 条目。",
+        "MISSING_IMAGE": "替换缺失图片路径为有效资源并保持路径可访问。",
+        "UNRENDERABLE_IMAGE_FORMATS_DETECTED": "替换 PDF/EPS 为 PNG/JPG/EMF 并保持图题不变。",
+        "TABLE_REF_UNMAPPED_ANCHORS": "重建对应表题编号并把文内引用改为 REF 字段。",
+        "EQUATION_REF_UNMAPPED_ANCHORS": "重建对应公式编号并把文内引用改为 REF 字段。",
+        "MISSING_ANCHORS_AFTER_POSTPROCESS": "为缺失锚点对象补建编号/书签并重建关键 REF 引用。",
+        "TOC_FIELD_NOT_DETECTED": "插入并更新目录字段，确认标题层级映射正确。",
+        "SEQ_FIELD_NOT_DETECTED": "重建关键图表题注的 SEQ 编号字段。",
+    }
+    if source_code in fixed_actions:
+        return fixed_actions[source_code].strip()
+
+    fallback_by_category = {
+        "images": "替换或重插对应图片并保持图题与引用一致。",
+        "tables": "修复表题与表格结构后重建关键交叉引用。",
+        "equations": "修复公式编号并重建关键公式引用。",
+        "cross_references": "重建错误引用为 Word REF 字段并校验跳转。",
+        "bibliography": "修正文献键并更新文末参考文献列表。",
+        "headings": "修复标题样式层级并刷新目录。",
+        "captions": "重建缺失图题/表题并更新字段。",
+        "conversion": "修改对应转换输入后重新转换并复核。",
+        "custom_macros": "修改源宏定义或结构后重新转换并复核。",
+        "conditional_build": "修改构建分支设置后重新转换并复核。",
+    }
+    if category in fallback_by_category:
+        return fallback_by_category[category]
+
+    return "修改对应对象后重新执行转换并更新字段复核。"
+
+
+def derive_verify_action(item: dict) -> str:
+    category = str(item.get("category", "")).strip()
+    if category == "images":
+        return "更新字段后搜索 Anchor，确认图片可见且图题对应正确。"
+    if category in {"tables", "equations", "cross_references"}:
+        return "执行 Ctrl+A -> F9，确认编号连续、引用可跳转且指向正确。"
+    if category == "bibliography":
+        return "更新字段后抽查文内引文，确认能定位到文末对应条目。"
+    if category == "headings":
+        return "更新目录并抽查三级标题，确认层级与页码同步。"
+    return "更新字段并抽查该锚点附近内容，确认问题已消失。"
+
+
+def estimate_fix_minutes(item: dict) -> str:
+    category = str(item.get("category", "")).strip()
+    priority = int(item.get("priority", 999))
+
+    by_category = {
+        "fields": "3-5 分钟",
+        "toc": "5-10 分钟",
+        "captions": "10-20 分钟",
+        "cross_references": "10-25 分钟",
+        "images": "15-30 分钟",
+        "tables": "15-35 分钟",
+        "equations": "20-40 分钟",
+        "bibliography": "10-20 分钟",
+        "custom_macros": "20-45 分钟",
+    }
+    if category in by_category:
+        return by_category[category]
+    if priority <= 120:
+        return "10-20 分钟"
+    return "15-30 分钟"
+
+
+def summarize_problem(item: dict) -> str:
+    summary = str(item.get("issue_summary", "")).strip()
+    title = str(item.get("title", "")).strip()
+    if summary:
+        return shorten_for_line(summary, 62)
+    return shorten_for_line(title, 62)
+
+
+def enrich_items_for_user_view(
+    items: list[dict],
+    index: TexIndex,
+    main_tex: Optional[str],
+) -> list[dict]:
+    """
+    为 Markdown 视图追加“定位、搜索键、单一路径修复动作”。
+    """
+    enriched: list[dict] = []
+    for raw in items:
+        item = dict(raw)
+        primary = build_primary_location(item, index, main_tex)
+        item["primary_location"] = primary
+        item["primary_location_text"] = format_primary_location(primary)
+        item["search_key"] = primary.get("anchor", "N/A")
+        item["problem_short"] = summarize_problem(item)
+        item["fix_action"] = derive_fix_action(item)
+        item["verify_action"] = derive_verify_action(item)
+        item["estimated_time"] = estimate_fix_minutes(item)
+        item["evidence_short"] = primary.get("evidence", "")
+        enriched.append(item)
+    return enriched
+
+
+# -----------------------------------------------------------------------------
 # 从各阶段报告映射为人工修复项
 # -----------------------------------------------------------------------------
 
@@ -997,7 +1535,10 @@ def items_from_precheck(precheck_report: Optional[dict]) -> list[ChecklistItem]:
         severity = finding.get("severity", "")
         code = finding.get("code", "")
         location = finding.get("file") or None
-        details = finding.get("details", {}) or {}
+        details = dict(finding.get("details", {}) or {})
+        line_no = finding.get("line")
+        if isinstance(line_no, int):
+            details.setdefault("source_line", line_no)
 
         # precheck 只将确实值得人工关注的对象转入清单。
         if code == "MISSING_IMAGE":
@@ -1189,7 +1730,10 @@ def items_from_normalization(normalization_report: Optional[dict]) -> list[Check
         severity = action.get("severity", "")
         action_type = action.get("action_type", "")
         location = action.get("file") or None
-        details = action.get("details", {}) or {}
+        details = dict(action.get("details", {}) or {})
+        line_no = action.get("line")
+        if isinstance(line_no, int):
+            details.setdefault("source_line", line_no)
 
         if action_type in {"normalize_autoref", "normalize_cref"}:
             items.append(
@@ -1267,7 +1811,10 @@ def items_from_normalization(normalization_report: Optional[dict]) -> list[Check
     return items
 
 
-def items_from_conversion(conversion_report: Optional[dict]) -> list[ChecklistItem]:
+def items_from_conversion(
+    conversion_report: Optional[dict],
+    docx_postprocess_report: Optional[dict],
+) -> list[ChecklistItem]:
     """
     将 Pandoc 主转换阶段的告警转为人工修复项。
 
@@ -1282,10 +1829,105 @@ def items_from_conversion(conversion_report: Optional[dict]) -> list[ChecklistIt
         return items
 
     warnings = conversion_report.get("warnings", [])
+    post_details = {}
+    if docx_postprocess_report and isinstance(docx_postprocess_report.get("details"), dict):
+        post_details = dict(docx_postprocess_report["details"])
+
     seq = 1
+
+    def add_structured_item(
+        *,
+        source_code: str,
+        title: str,
+        category: str,
+        priority: int,
+        issue_summary: str,
+        affects_delivery: str,
+        anchors: Optional[list[str]] = None,
+    ) -> None:
+        nonlocal seq, items
+        details = {"anchors": anchors or []}
+        if anchors:
+            details["anchor_count"] = len(anchors)
+        items.append(
+            make_item(
+                item_id=f"C{seq:02d}",
+                priority=priority,
+                category=category,
+                title=title,
+                source_stage="conversion",
+                source_code=source_code,
+                location="stage_convert/docx-postprocess-report.json",
+                issue_summary=issue_summary,
+                why_it_matters="这类条目已具备锚点级线索，可直接进入源文档与 Word 双向定点修复。",
+                recommended_actions=[
+                    "按清单给出的 Anchor 回源定位并修复，再更新 Word 字段验证编号与跳转。",
+                ],
+                affects_delivery=affects_delivery,
+                details=details,
+            )
+        )
+        seq += 1
+
+    equation_unmapped = post_details.get("equation_ref_unmapped_anchors")
+    if isinstance(equation_unmapped, list) and equation_unmapped:
+        add_structured_item(
+            source_code="EQUATION_REF_UNMAPPED_ANCHORS",
+            title="修复未映射的公式引用锚点",
+            category="equations",
+            priority=145,
+            issue_summary=f"检测到 {len(equation_unmapped)} 个公式锚点未映射到编号，文内公式引用可能失效或错跳。",
+            affects_delivery=DELIVERY_HIGH,
+            anchors=[str(anchor) for anchor in equation_unmapped if str(anchor).strip()],
+        )
+
+    table_unmapped = post_details.get("table_ref_unmapped_anchors")
+    if isinstance(table_unmapped, list) and table_unmapped:
+        add_structured_item(
+            source_code="TABLE_REF_UNMAPPED_ANCHORS",
+            title="修复未映射的表格引用锚点",
+            category="tables",
+            priority=148,
+            issue_summary=f"检测到 {len(table_unmapped)} 个表格锚点未映射到表题，文内表格引用可能失效或错跳。",
+            affects_delivery=DELIVERY_HIGH,
+            anchors=[str(anchor) for anchor in table_unmapped if str(anchor).strip()],
+        )
+
+    figure_unmapped = post_details.get("figure_ref_unmapped_anchors")
+    if isinstance(figure_unmapped, list) and figure_unmapped:
+        add_structured_item(
+            source_code="FIGURE_REF_UNMAPPED_ANCHORS",
+            title="修复未映射的图片引用锚点",
+            category="images",
+            priority=149,
+            issue_summary=f"检测到 {len(figure_unmapped)} 个图片锚点未映射到图题，文内图引用可能失效或错跳。",
+            affects_delivery=DELIVERY_HIGH,
+            anchors=[str(anchor) for anchor in figure_unmapped if str(anchor).strip()],
+        )
+
+    missing_anchors = post_details.get("missing_anchors_sample_after")
+    if isinstance(missing_anchors, list) and missing_anchors:
+        add_structured_item(
+            source_code="MISSING_ANCHORS_AFTER_POSTPROCESS",
+            title="处理后处理阶段仍缺失的内部锚点",
+            category="cross_references",
+            priority=155,
+            issue_summary=f"后处理后仍有 {len(missing_anchors)} 个内部锚点缺失，关键交叉引用存在残留风险。",
+            affects_delivery=DELIVERY_HIGH,
+            anchors=[str(anchor) for anchor in missing_anchors if str(anchor).strip()],
+        )
+
+    skip_warning_keywords = [
+        "table 风格锚点未映射",
+        "equation 风格锚点未映射",
+        "内部锚点缺失",
+    ]
+
     for warning in warnings:
         text = str(warning).strip()
         if not text:
+            continue
+        if any(keyword in text for keyword in skip_warning_keywords):
             continue
 
         # 尽量按关键词给出更具体分类；否则归入 conversion。
@@ -1318,9 +1960,7 @@ def items_from_conversion(conversion_report: Optional[dict]) -> list[ChecklistIt
                 issue_summary=text,
                 why_it_matters="主转换阶段的告警往往意味着文档虽然生成成功，但某些对象的质量仍不可靠，后续需要重点核查。",
                 recommended_actions=[
-                    "打开 pandoc-conversion-report.md 查看该告警对应的上下文。",
-                    "结合 postcheck 报告，确认相关对象是否真的在 docx 中出现质量问题。",
-                    "若该告警与关键图表、公式或参考文献相关，应提高其修复优先级。",
+                    "先按该告警涉及对象执行一次定点核查并修复。",
                 ],
                 affects_delivery=impact,
                 details={"warning_text": text},
@@ -1719,76 +2359,101 @@ def render_markdown_report(report: ManualFixChecklistReport) -> str:
     - 不要求用户理解上游脚本的内部实现。
     """
     lines: list[str] = []
+    raw_items = report.items if isinstance(report.items, list) else []
+    items = [item for item in raw_items if str(item.get("source_stage", "")).lower() != "global"]
+    if not items:
+        items = raw_items
+
+    def is_precise(item: dict) -> bool:
+        primary = item.get("primary_location") if isinstance(item.get("primary_location"), dict) else {}
+        source = str(primary.get("source", "")).strip()
+        anchor = str(primary.get("anchor", "")).strip()
+        source_quality = str(primary.get("source_quality", "")).strip()
+        anchor_quality = str(primary.get("anchor_quality", "")).strip()
+        if not source or source == "N/A":
+            return False
+        if ":" not in source:
+            return False
+        if not anchor or anchor in {"N/A", "UNKNOWN"}:
+            return False
+        if source_quality != "exact":
+            return False
+        if anchor_quality != "exact":
+            return False
+        return True
+
+    def project_name() -> str:
+        if report.source_project_root:
+            return Path(report.source_project_root).name
+        return Path(report.work_root).name
+
+    total_items = len(items)
+    high_priority_items = [item for item in items if str(item.get("affects_delivery", "")).lower() == DELIVERY_HIGH]
+    high_priority_count = len(high_priority_items)
+    top_candidates = [item for item in high_priority_items if is_precise(item)]
+    top_candidates.sort(key=lambda x: (int(x.get("priority", 999)), str(x.get("item_id", ""))))
+    top5 = top_candidates[:5]
 
     lines.append("# Manual Fix Checklist")
     lines.append("")
-    lines.append(f"- Status: **{report.status}**")
-    lines.append(f"- Can continue: **{report.can_continue}**")
-    lines.append(f"- Work root: `{report.work_root}`")
-    lines.append(f"- Source project root: `{report.source_project_root or 'N/A'}`")
-    lines.append(f"- Used precheck report: **{report.used_precheck_report}**")
-    lines.append(f"- Used normalization report: **{report.used_normalization_report}**")
-    lines.append(f"- Used conversion report: **{report.used_conversion_report}**")
-    lines.append(f"- Used postcheck report: **{report.used_postcheck_report}**")
-    lines.append(f"- User view generated: **{report.user_view_generated}**")
-    lines.append(f"- User view root: `{report.user_view_root or 'N/A'}`")
-    lines.append(f"- Published file count: **{report.published_file_count}**")
+    lines.append("## 文档头部")
+    lines.append("")
+    lines.append(f"- 项目：`{project_name()}`")
+    lines.append(f"- 主 TeX：`{report.main_tex or 'N/A'}`")
+    lines.append(f"- 输出 DOCX：`{report.output_docx or 'N/A'}`")
+    lines.append(f"- 生成时间：`{report.generated_at}`")
+    lines.append(f"- 总问题数：**{total_items}**")
+    lines.append(f"- 高优先级数：**{high_priority_count}**")
     lines.append("")
 
-    lines.append("## Summary")
+    lines.append("## 快速处理区（Top 5）")
     lines.append("")
-    for key, value in report.summary.items():
-        lines.append(f"- {key}: **{value}**")
-    lines.append("")
-
-    lines.append("## Metrics")
-    lines.append("")
-    for key, value in report.metrics.items():
-        lines.append(f"- {key}: **{value}**")
-    lines.append("")
-
-    lines.append("## Execution Order")
-    lines.append("")
-    lines.append("建议按以下顺序执行：")
-    lines.append("")
-    lines.append("1. 先处理 G 类全局步骤")
-    lines.append("2. 再处理 D 类（postcheck）中的高优先级问题")
-    lines.append("3. 再处理 P / N / C 类中的源侧或流程侧遗留问题")
-    lines.append("4. 每修一轮后，在 Word 中再次更新全部字段并做抽查")
+    if not top5:
+        lines.append("- 暂无满足“高优先级且含 Source+Anchor 精确定位”的条目。")
+    else:
+        for idx, item in enumerate(top5, start=1):
+            lines.append(
+                f"{idx}. [{item.get('item_id', '')}] {item.get('problem_short', item.get('title', ''))} | "
+                f"Primary Location: {item.get('primary_location_text', 'N/A')} | "
+                f"预计修复时间：{item.get('estimated_time', '10-20 分钟')}"
+            )
     lines.append("")
 
-    lines.append("## Checklist Items")
+    lines.append("## Checklist Items（简表）")
     lines.append("")
-    if not report.items:
+    lines.append("| ID | Priority | 问题 | Primary Location | 搜索键 | 影响 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    if not items:
+        lines.append("| - | - | No items | - | - | - |")
+    else:
+        for item in items:
+            primary = item.get("primary_location") if isinstance(item.get("primary_location"), dict) else {}
+            primary_source = str(primary.get("source", "N/A")).strip() or "N/A"
+            primary_anchor = str(primary.get("anchor", "N/A")).strip() or "N/A"
+            primary_cell = shorten_for_line(f"{primary_source}; {primary_anchor}", 58)
+            lines.append(
+                f"| {item.get('item_id', '')} | {item.get('priority', '')} | "
+                f"{shorten_for_line(str(item.get('problem_short', item.get('title', ''))), 30)} | "
+                f"{primary_cell} | "
+                f"{shorten_for_line(str(item.get('search_key', 'N/A')), 20)} | "
+                f"{item.get('affects_delivery', '')} |"
+            )
+    lines.append("")
+
+    lines.append("## 详细修复卡片（逐条）")
+    lines.append("")
+    if not items:
         lines.append("- No checklist items generated.")
         lines.append("")
     else:
-        for item in report.items:
-            lines.append(f"### {item['item_id']} | priority={item['priority']} | {item['title']}")
+        for item in items:
+            lines.append(f"### {item.get('item_id', '')} | P{item.get('priority', '')} | {item.get('title', '')}")
+            lines.append(f"问题：{item.get('problem_short', item.get('title', ''))}")
+            lines.append(f"定位：Primary Location: {item.get('primary_location_text', 'N/A')}")
+            lines.append(f"修复动作：{item.get('fix_action', '修改对应对象并重转。')}")
+            lines.append(f"验证动作：{item.get('verify_action', '更新字段并核对该问题。')}")
+            lines.append(f"证据：{item.get('evidence_short', '')}")
             lines.append("")
-            lines.append(f"- Category: **{item['category']}**")
-            lines.append(f"- Source stage: **{item['source_stage']}**")
-            lines.append(f"- Source code: **{item['source_code']}**")
-            lines.append(f"- Location: `{item['location'] or 'N/A'}`")
-            lines.append(f"- Affects delivery: **{item['affects_delivery']}**")
-            lines.append(f"- Issue: {item['issue_summary']}")
-            lines.append(f"- Why it matters: {item['why_it_matters']}")
-            lines.append("- Recommended actions:")
-            if item["recommended_actions"]:
-                for action in item["recommended_actions"]:
-                    lines.append(f"  - {action}")
-            else:
-                lines.append("  - (none)")
-            lines.append("")
-
-    lines.append("## Recommendations")
-    lines.append("")
-    if report.recommendations:
-        for recommendation in report.recommendations:
-            lines.append(f"- {recommendation}")
-    else:
-        lines.append("- No additional recommendations.")
-    lines.append("")
 
     return "\n".join(lines)
 
@@ -1856,6 +2521,23 @@ def main() -> int:
     conversion_report = load_json_if_exists(conversion_json_path) if conversion_json_path else None
     postcheck_report = load_json_if_exists(postcheck_json_path) if postcheck_json_path else None
 
+    docx_postprocess_report = None
+    docx_postprocess_json_path: Optional[Path] = None
+    if conversion_report and isinstance(conversion_report, dict):
+        docx_postprocess_json_path = _resolve_path_like(
+            conversion_report.get("docx_postprocess_report_json"),
+            work_root,
+        )
+    if docx_postprocess_json_path is None:
+        docx_postprocess_json_path = stage_default_or_legacy(
+            work_root,
+            STAGE_CONVERT,
+            "docx-postprocess-report.json",
+            legacy_filename="docx-postprocess-report.json",
+        )
+    if docx_postprocess_json_path is not None:
+        docx_postprocess_report = load_json_if_exists(docx_postprocess_json_path)
+
     used_precheck_report = precheck_report is not None
     used_normalization_report = normalization_report is not None
     used_conversion_report = conversion_report is not None
@@ -1909,7 +2591,7 @@ def main() -> int:
     for item in items_from_normalization(normalization_report):
         append_dedup(items, seen, item)
 
-    for item in items_from_conversion(conversion_report):
+    for item in items_from_conversion(conversion_report, docx_postprocess_report):
         append_dedup(items, seen, item)
 
     for item in items_from_postcheck(postcheck_report):
@@ -1984,16 +2666,60 @@ def main() -> int:
     if not used_precheck_report:
         recommendations.append("缺少 precheck 报告时，源工程侧的风险信息会不完整；若需要回源修复，建议补跑 precheck.py。")
 
+    main_tex_path_from_conversion: Optional[Path] = None
+    if conversion_report and isinstance(conversion_report.get("main_tex"), str):
+        main_tex_path_from_conversion = _resolve_path_like(conversion_report.get("main_tex"), work_root)
+
+    tex_root: Optional[Path] = None
+    if main_tex_path_from_conversion and main_tex_path_from_conversion.exists():
+        tex_root = main_tex_path_from_conversion.parent
+    else:
+        candidate_snapshot_root = stage_default_or_legacy(
+            work_root,
+            STAGE_NORMALIZE,
+            "source_snapshot",
+            legacy_filename="source_snapshot",
+        )
+        if candidate_snapshot_root.exists():
+            tex_root = candidate_snapshot_root
+
+    tex_index = build_tex_index(tex_root)
+
+    main_tex_display = None
+    if normalization_report and isinstance(normalization_report.get("source_main_tex"), str):
+        main_tex_display = str(normalization_report.get("source_main_tex")).replace("\\", "/")
+    elif main_tex_path_from_conversion is not None:
+        if tex_root is not None and tex_root.exists():
+            try:
+                main_tex_display = main_tex_path_from_conversion.relative_to(tex_root).as_posix()
+            except Exception:
+                main_tex_display = main_tex_path_from_conversion.name
+        else:
+            main_tex_display = main_tex_path_from_conversion.name
+
+    output_docx_display = None
+    if conversion_report and isinstance(conversion_report.get("output_docx"), str):
+        output_docx_display = str(conversion_report.get("output_docx"))
+
+    enriched_items = enrich_items_for_user_view(
+        [asdict(item) for item in items],
+        index=tex_index,
+        main_tex=main_tex_display,
+    )
+
     report = ManualFixChecklistReport(
         status=status,
         can_continue=can_continue,
+        generated_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         work_root=str(work_root.resolve()),
         source_project_root=str(source_project_root.resolve()) if source_project_root else None,
+        main_tex=main_tex_display,
+        output_docx=output_docx_display,
         used_precheck_report=used_precheck_report,
         used_normalization_report=used_normalization_report,
         used_conversion_report=used_conversion_report,
         used_postcheck_report=used_postcheck_report,
-        items=[asdict(item) for item in items],
+        items=enriched_items,
         metrics=metrics,
         summary=summary,
         recommendations=recommendations,
