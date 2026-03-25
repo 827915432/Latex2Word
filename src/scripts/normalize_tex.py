@@ -21,15 +21,18 @@ normalize_tex.py
 5. 将常见扩展交叉引用命令做保守降级：
    - \\autoref{...} -> \\ref{...}
    - \\cref{a,b} / \\Cref{a,b} -> \\ref{a}, \\ref{b}
-6. 在 figure / table 环境中，当检测到“\\label 紧邻且位于 \\caption 前”时，
+   - \\subref{...} -> \\ref{...}
+6. 在 align 系环境中，当检测到“行首 \\label”时，将其调整到该行公式尾部；
+7. 在数学上下文中规范化旧式命令（如 \\rm/\\bf/\\cal/\\buildrel）；
+8. 在 figure / table 环境中，当检测到“\\label 紧邻且位于 \\caption 前”时，
    将其调整为“\\caption 后紧跟 \\label”；
-7. 将 ``table*`` 环境保守降级为 ``table``（保留内容与可选参数不变）；
-8. 将 ``algorithm / algorithm*``（含 algorithm2e 语法）降级为 Pandoc 稳定块结构；
-9. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
+9. 将 ``table*`` 环境保守降级为 ``table``（保留内容与可选参数不变）；
+10. 将 ``algorithm / algorithm*``（含 algorithm2e 语法）降级为 Pandoc 稳定块结构；
+11. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
    - 支持 \\newcommand / \\renewcommand / \\providecommand
    - 仅展开零参数、短小、无参数占位符的定义
    - 不覆盖原定义，只在正文使用位置做文本替换
-10. 生成结构化 JSON 报告与 Markdown 报告。
+12. 生成结构化 JSON 报告与 Markdown 报告。
 
 设计边界
 --------
@@ -124,6 +127,22 @@ from tex_scan_common import (
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps", ".bmp", ".tif", ".tiff"]
 BIB_EXTENSIONS = [".bib"]
+MATH_BLOCK_ENV_NAMES = (
+    "equation",
+    "equation*",
+    "align",
+    "align*",
+    "alignat",
+    "alignat*",
+    "flalign",
+    "flalign*",
+    "gather",
+    "gather*",
+    "multline",
+    "multline*",
+    "eqnarray",
+    "eqnarray*",
+)
 
 # 默认忽略复制的目录/文件名。
 # 这些内容对 LaTeX -> Word 主流程没有帮助，反而会污染工作副本。
@@ -957,6 +976,303 @@ def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str
     return text, actions
 
 
+def normalize_align_leading_labels(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    规范化 align 系环境中“行首 \\label”的位置。
+
+    目标：
+    - 将形如 ``\\label{eq:x}& a=b\\\\`` 的写法改为 ``& a=b\\label{eq:x}\\\\``；
+    - 降低 Pandoc 对 align 数学块解析失败概率；
+    - 保持标签文本不变，仅调整槽位位置。
+
+    处理边界：
+    - 仅处理 ``align / align* / alignat / alignat* / flalign / flalign*``；
+    - 仅当 ``\\label`` 与同一行公式内容共行时移动；
+    - 独立成行的 ``\\label`` 保持不动，避免错误挂接到下一行。
+    """
+    actions: list[ActionRecord] = []
+
+    align_env_pattern = re.compile(
+        r"\\begin\{(?P<env>align\*?|alignat\*?|flalign\*?)\}(?P<body>.*?)\\end\{(?P=env)\}",
+        re.DOTALL,
+    )
+    leading_label_pattern = re.compile(
+        r"^(?P<indent>[ \t]*)\\label\{(?P<label>[^}]+)\}(?P<tail>[^\n]*)$",
+        re.MULTILINE,
+    )
+
+    def normalize_body(body: str, body_offset: int) -> str:
+        def move_label(match: re.Match) -> str:
+            tail = match.group("tail")
+            if not tail.strip():
+                return match.group(0)
+
+            label = match.group("label").strip()
+            indent = match.group("indent")
+
+            tail_stripped = tail.rstrip()
+            trailing_ws = tail[len(tail_stripped):]
+
+            linebreak_match = re.search(r"(\\\\(?:\[[^\]]*\])?)\s*$", tail_stripped)
+            if linebreak_match:
+                equation_part = tail_stripped[:linebreak_match.start()].rstrip()
+                linebreak_part = linebreak_match.group(1)
+                if not equation_part:
+                    return match.group(0)
+                new_tail = f"{equation_part}\\label{{{label}}}{linebreak_part}"
+            else:
+                equation_part = tail_stripped
+                if not equation_part:
+                    return match.group(0)
+                new_tail = f"{equation_part}\\label{{{label}}}"
+
+            line_no = line_number_from_offset(text, body_offset + match.start())
+            actions.append(
+                ActionRecord(
+                    action_type="normalize_align_leading_label",
+                    severity=SEVERITY_INFO,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="将 align 系环境中的行首 \\label 调整到公式行尾。",
+                    details={"label": label},
+                )
+            )
+            return f"{indent}{new_tail}{trailing_ws}"
+
+        return leading_label_pattern.sub(move_label, body)
+
+    def repl(match: re.Match) -> str:
+        env_name = match.group("env")
+        body = match.group("body")
+        body_offset = match.start("body")
+        new_body = normalize_body(body, body_offset)
+        if new_body == body:
+            return match.group(0)
+        return f"\\begin{{{env_name}}}{new_body}\\end{{{env_name}}}"
+
+    new_text = align_env_pattern.sub(repl, text)
+    return new_text, actions
+
+
+def normalize_legacy_math_commands(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    在数学上下文中规范化旧式命令，提升 Pandoc 数学解析稳定性。
+
+    处理内容：
+    - ``\\textbf{\\textit{x}}`` / ``\\textit{\\textbf{x}}`` -> ``\\boldsymbol{x}``
+    - ``\\rm{...}`` / ``{\\rm ...}`` -> ``\\mathrm{...}``
+    - ``\\bf{...}`` / ``{\\bf ...}`` -> ``\\mathbf{...}``
+    - ``\\cal X`` / ``\\cal{X}`` -> ``\\mathcal{X}``
+    - ``\\buildrel A \\over B`` -> ``\\overset{A}{B}``
+
+    处理边界：
+    - 仅作用于数学上下文（$...$、\\(...\\)、\\[...\\]、常见数学环境）；
+    - 不改写普通正文中的文本样式命令。
+    """
+    actions: list[ActionRecord] = []
+    working_text = text
+
+    # 数学内容内部的局部替换规则。
+    bold_italic_pattern = re.compile(r"\\textbf\s*\{\s*\\textit\s*\{(?P<body>[^{}]+)\}\s*\}")
+    italic_bold_pattern = re.compile(r"\\textit\s*\{\s*\\textbf\s*\{(?P<body>[^{}]+)\}\s*\}")
+    rm_boldtext_group_pattern = re.compile(
+        r"\\rm\s*\{\s*\\textbf\s*\{(?P<body>[^{}]+)\}\s*\}"
+    )
+    rm_boldtext_legacy_pattern = re.compile(
+        r"\{\s*\\rm\s*\{\s*\\textbf\s*\{(?P<body>[^{}]+)\}\s*\}\s*\}"
+    )
+    rm_group_pattern = re.compile(r"\\rm\s*\{(?P<body>[^{}]+)\}")
+    rm_legacy_pattern = re.compile(r"\{\s*\\rm\s+(?P<body>[^{}]+?)\s*\}")
+    bf_group_pattern = re.compile(r"\\bf\s*\{(?P<body>[^{}]+)\}")
+    bf_legacy_pattern = re.compile(r"\{\s*\\bf\s+(?P<body>[^{}]+?)\s*\}")
+    bf_token_pattern = re.compile(r"\\bf\s+(?P<body>[^\s\\{}(),;]+)")
+    cal_group_pattern = re.compile(r"\\cal\s*\{(?P<body>[^{}]+)\}")
+    cal_token_pattern = re.compile(r"\\cal\s+(?P<body>[A-Za-z])")
+    buildrel_pattern = re.compile(
+        r"\\buildrel\s+"
+        r"(?P<top>(?:\\[A-Za-z]+|\\\S|\{[^{}]+\}|[^\\{}\s]+))"
+        r"\s+\\over\s+"
+        r"(?P<base>(?:\\[A-Za-z]+|\\\S|\{[^{}]+\}|[^\\{}\s]+))"
+    )
+
+    def transform_math_fragment(fragment: str, fragment_offset: int) -> str:
+        nonlocal actions
+        local_text = fragment
+
+        def apply_pattern(
+            content: str,
+            pattern: re.Pattern,
+            action_type: str,
+            message: str,
+            builder,
+        ) -> str:
+            def repl(match: re.Match) -> str:
+                line_no = line_number_from_offset(working_text, fragment_offset + match.start())
+                replacement = builder(match)
+                actions.append(
+                    ActionRecord(
+                        action_type=action_type,
+                        severity=SEVERITY_INFO,
+                        file=safe_relative(file_path, root),
+                        line=line_no,
+                        message=message,
+                        details={
+                            "from": match.group(0),
+                            "to": replacement,
+                        },
+                    )
+                )
+                return replacement
+
+            return pattern.sub(repl, content)
+
+        local_text = apply_pattern(
+            local_text,
+            bold_italic_pattern,
+            "normalize_math_bold_italic",
+            "将数学中的 \\textbf{\\textit{...}} 规范化为 \\boldsymbol{...}。",
+            lambda match: f"\\boldsymbol{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            italic_bold_pattern,
+            "normalize_math_bold_italic",
+            "将数学中的 \\textit{\\textbf{...}} 规范化为 \\boldsymbol{...}。",
+            lambda match: f"\\boldsymbol{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            rm_boldtext_group_pattern,
+            "normalize_math_rm",
+            "将数学中的 \\rm{\\textbf{...}} 规范化为 \\text{...}。",
+            lambda match: f"\\text{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            rm_boldtext_legacy_pattern,
+            "normalize_math_rm",
+            "将数学中的 {\\rm{\\textbf{...}}} 规范化为 \\text{...}。",
+            lambda match: f"\\text{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            rm_group_pattern,
+            "normalize_math_rm",
+            "将数学中的 \\rm{...} 规范化为 \\mathrm{...}。",
+            lambda match: f"\\mathrm{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            rm_legacy_pattern,
+            "normalize_math_rm",
+            "将数学中的 {\\rm ...} 规范化为 \\mathrm{...}。",
+            lambda match: f"\\mathrm{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            bf_group_pattern,
+            "normalize_math_bf",
+            "将数学中的 \\bf{...} 规范化为 \\mathbf{...}。",
+            lambda match: f"\\mathbf{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            bf_legacy_pattern,
+            "normalize_math_bf",
+            "将数学中的 {\\bf ...} 规范化为 \\mathbf{...}。",
+            lambda match: f"\\mathbf{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            bf_token_pattern,
+            "normalize_math_bf",
+            "将数学中的 \\bf X 规范化为 \\mathbf{X}。",
+            lambda match: f"\\mathbf{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            cal_group_pattern,
+            "normalize_math_cal",
+            "将数学中的 \\cal{...} 规范化为 \\mathcal{...}。",
+            lambda match: f"\\mathcal{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            cal_token_pattern,
+            "normalize_math_cal",
+            "将数学中的 \\cal X 规范化为 \\mathcal{X}。",
+            lambda match: f"\\mathcal{{{match.group('body').strip()}}}",
+        )
+        local_text = apply_pattern(
+            local_text,
+            buildrel_pattern,
+            "normalize_math_buildrel",
+            "将数学中的 \\buildrel A \\over B 规范化为 \\overset{A}{B}。",
+            lambda match: f"\\overset{{{match.group('top').strip()}}}{{{match.group('base').strip()}}}",
+        )
+        return local_text
+
+    def normalize_by_pattern(
+        source: str,
+        pattern: re.Pattern,
+        content_group: str,
+        wrapper,
+    ) -> str:
+        cursor = 0
+        parts: list[str] = []
+        for match in pattern.finditer(source):
+            parts.append(source[cursor:match.start()])
+            original_content = match.group(content_group)
+            content_offset = match.start(content_group)
+            normalized_content = transform_math_fragment(original_content, content_offset)
+            parts.append(wrapper(match, normalized_content))
+            cursor = match.end()
+        parts.append(source[cursor:])
+        return "".join(parts)
+
+    env_names = "|".join(re.escape(item) for item in MATH_BLOCK_ENV_NAMES)
+    math_env_pattern = re.compile(
+        rf"\\begin\{{(?P<env>{env_names})\}}(?P<body>.*?)\\end\{{(?P=env)\}}",
+        re.DOTALL,
+    )
+    display_bracket_pattern = re.compile(r"\\\[(?P<body>.*?)\\\]", re.DOTALL)
+    display_dollar_pattern = re.compile(r"(?<!\\)\$\$(?P<body>.*?)(?<!\\)\$\$", re.DOTALL)
+    inline_paren_pattern = re.compile(r"\\\((?P<body>.*?)\\\)", re.DOTALL)
+    inline_dollar_pattern = re.compile(r"(?<!\\)\$(?!\$)(?P<body>.*?)(?<!\\)\$(?!\$)", re.DOTALL)
+
+    working_text = normalize_by_pattern(
+        working_text,
+        math_env_pattern,
+        "body",
+        lambda match, body: f"\\begin{{{match.group('env')}}}{body}\\end{{{match.group('env')}}}",
+    )
+    working_text = normalize_by_pattern(
+        working_text,
+        display_bracket_pattern,
+        "body",
+        lambda _match, body: f"\\[{body}\\]",
+    )
+    working_text = normalize_by_pattern(
+        working_text,
+        display_dollar_pattern,
+        "body",
+        lambda _match, body: f"$${body}$$",
+    )
+    working_text = normalize_by_pattern(
+        working_text,
+        inline_paren_pattern,
+        "body",
+        lambda _match, body: f"\\({body}\\)",
+    )
+    working_text = normalize_by_pattern(
+        working_text,
+        inline_dollar_pattern,
+        "body",
+        lambda _match, body: f"${body}$",
+    )
+    return working_text, actions
+
+
 def downgrade_subfloat_wrappers(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
     """
     在 figure 环境内将 ``\\subfloat`` / ``\\subfigure`` 保守降级为稳定 minipage 结构。
@@ -1514,6 +1830,26 @@ def expand_zero_arg_macros(
     actions: list[ActionRecord] = []
     prefix, body = split_document_body(text)
 
+    def is_macro_definition_target(content: str, start: int) -> bool:
+        """
+        判断当前位置是否落在“宏定义目标位”。
+
+        例如以下写法中的 `\\foo` 不应被展开：
+        - \\renewcommand\\foo{...}
+        - \\renewcommand{\\foo}{...}
+        - \\newcommand\\foo{...}
+        - \\def\\foo{...}
+        - \\let\\foo\\bar
+        """
+        window_start = max(0, start - 160)
+        context = content[window_start:start]
+        return bool(
+            re.search(
+                r"(?:\\(?:newcommand|renewcommand|providecommand)\*?\s*\{?\s*|\\(?:def|gdef|xdef|edef|let)\s*)$",
+                context,
+            )
+        )
+
     # 为减少短命令与长命令前缀碰撞，按命令名长度逆序处理。
     ordered_macros = sorted(macros.values(), key=lambda item: len(item.name), reverse=True)
 
@@ -1525,6 +1861,9 @@ def expand_zero_arg_macros(
 
             def repl(match: re.Match) -> str:
                 nonlocal actions, any_replaced, body
+                if is_macro_definition_target(body, match.start()):
+                    return match.group(0)
+
                 any_replaced = True
                 line_no = line_number_from_offset(prefix + body, len(prefix) + match.start())
                 actions.append(
@@ -1572,11 +1911,13 @@ def process_tex_file(
     2. 补全图片扩展名
     3. 补全 bib 扩展名
     4. 规范化扩展交叉引用
-    5. 降级 subfloat / subfigure 包装
-    6. 调整 float 中 caption / label 顺序
-    7. 将 table* 环境降级为 table
-    8. 将 algorithm 环境降级为 Pandoc 稳定块结构
-    9. 展开安全零参数宏
+    5. 规范化 align 系环境中的行首 label 位置
+    6. 规范化数学上下文中的旧式命令
+    7. 降级 subfloat / subfigure 包装
+    8. 调整 float 中 caption / label 顺序
+    9. 将 table* 环境降级为 table
+    10. 将 algorithm 环境降级为 Pandoc 稳定块结构
+    11. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -1598,6 +1939,12 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = normalize_extended_refs(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = normalize_align_leading_labels(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = normalize_legacy_math_commands(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = downgrade_subfloat_wrappers(text, file_path, work_root)
