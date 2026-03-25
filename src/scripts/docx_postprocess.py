@@ -641,6 +641,137 @@ def _select_algorithm_table_style_id(styles_root: ET.Element) -> str:
     return ""
 
 
+def _find_preferred_table_style_id(styles_root: ET.Element) -> str:
+    """
+    在 reference.docx 的表格样式中优先选择“三线表”风格。
+
+    匹配优先级：
+    1) styleId 或样式名精确命中常见三线表关键词；
+    2) 样式名包含“三线表 / threeline / booktabs”等语义词。
+    """
+    preferred_tokens = {
+        "三线表",
+        "threelinetable",
+        "threeline",
+        "booktabstable",
+        "booktabs",
+    }
+    fuzzy_hits: list[str] = []
+
+    for style in styles_root.findall("./w:style", NS):
+        if style.get(wqn("type"), "") != "table":
+            continue
+        style_id = (style.get(wqn("styleId"), "") or "").strip()
+        if not style_id:
+            continue
+
+        name_node = style.find("./w:name", NS)
+        style_name = ""
+        if name_node is not None:
+            style_name = (name_node.get(wqn("val"), "") or "").strip()
+
+        normalized_id = _normalize_style_name(style_id)
+        normalized_name = _normalize_style_name(style_name)
+
+        if normalized_id in preferred_tokens or normalized_name in preferred_tokens:
+            return style_id
+
+        joined = f"{normalized_id} {normalized_name}".strip()
+        if any(token in joined for token in ("三线表", "threeline", "booktabs")):
+            fuzzy_hits.append(style_id)
+
+    if fuzzy_hits:
+        return fuzzy_hits[0]
+    return ""
+
+
+def _table_style_id(table: ET.Element) -> str:
+    tbl_pr = table.find("./w:tblPr", NS)
+    if tbl_pr is None:
+        return ""
+    tbl_style = tbl_pr.find("./w:tblStyle", NS)
+    if tbl_style is None:
+        return ""
+    return (tbl_style.get(wqn("val"), "") or "").strip()
+
+
+def _set_table_style_id(
+    table: ET.Element,
+    style_id: str,
+    *,
+    replace_default_only: bool = True,
+) -> bool:
+    if not style_id:
+        return False
+
+    tbl_pr = table.find("./w:tblPr", NS)
+    if tbl_pr is None:
+        tbl_pr = ET.Element(wqn("tblPr"))
+        table.insert(0, tbl_pr)
+
+    tbl_style = tbl_pr.find("./w:tblStyle", NS)
+    current_style = ""
+    if tbl_style is not None:
+        current_style = (tbl_style.get(wqn("val"), "") or "").strip()
+
+    if current_style == style_id:
+        return False
+
+    if replace_default_only and current_style:
+        normalized_current = _normalize_style_name(current_style)
+        default_style_tokens = {"table", "tablegrid", "normaltable"}
+        if normalized_current not in default_style_tokens:
+            return False
+
+    if tbl_style is None:
+        tbl_style = ET.SubElement(tbl_pr, wqn("tblStyle"))
+    tbl_style.set(wqn("val"), style_id)
+    return True
+
+
+def _table_looks_like_algorithm_wrapper(table: ET.Element) -> bool:
+    paragraphs = table.findall(".//w:p", NS)
+    if not paragraphs:
+        return False
+
+    title_text = _paragraph_text(paragraphs[0]).strip()
+    if not ALGORITHM_TITLE_PATTERN.match(title_text):
+        return False
+
+    return any(_paragraph_has_numbering(paragraph) for paragraph in paragraphs[1:])
+
+
+def _apply_preferred_table_style(
+    document_root: ET.Element,
+    *,
+    preferred_style_id: str,
+) -> tuple[int, int, int]:
+    """
+    将 docx 中普通表格样式切换为三线表样式。
+
+    返回：
+    - applied_count
+    - candidate_count
+    - skipped_algorithm_count
+    """
+    if not preferred_style_id:
+        return 0, 0, 0
+
+    applied_count = 0
+    candidate_count = 0
+    skipped_algorithm_count = 0
+
+    for table in document_root.findall(".//w:tbl", NS):
+        candidate_count += 1
+        if _table_looks_like_algorithm_wrapper(table):
+            skipped_algorithm_count += 1
+            continue
+        if _set_table_style_id(table, preferred_style_id, replace_default_only=True):
+            applied_count += 1
+
+    return applied_count, candidate_count, skipped_algorithm_count
+
+
 def _build_algorithm_table(paragraphs: list[ET.Element], table_style_id: str) -> ET.Element:
     """
     将若干段落封装为 1x1 的算法表格。
@@ -2154,6 +2285,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
 
     figure_style_ids, table_style_ids, generic_caption_style_ids = _parse_caption_style_ids(styles_root)
     mt_display_equation_style_id = _find_mt_display_equation_style_id(styles_root)
+    preferred_table_style_id = _find_preferred_table_style_id(styles_root)
 
     body = document_root.find("./w:body", NS)
     if body is None:
@@ -2169,6 +2301,14 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     ) = _wrap_algorithm_blocks_as_tables(
         body=body,
         styles_root=styles_root,
+    )
+    (
+        table_style_applied_count,
+        table_style_candidate_count,
+        table_style_skipped_algorithm_count,
+    ) = _apply_preferred_table_style(
+        document_root=document_root,
+        preferred_style_id=preferred_table_style_id,
     )
 
     elements = list(body)
@@ -2492,6 +2632,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         value > 0
         for value in (
             algorithm_table_wrapped_count,
+            table_style_applied_count,
             figure_seq_added,
             table_seq_added,
             equation_seq_added,
@@ -2515,6 +2656,9 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "algorithm_block_wrapped_count": algorithm_table_wrapped_count,
         "algorithm_block_skipped_count": algorithm_block_skipped_count,
         "algorithm_paragraph_wrapped_count": algorithm_table_wrapped_paragraph_count,
+        "table_style_candidate_count": table_style_candidate_count,
+        "table_style_applied_count": table_style_applied_count,
+        "table_style_skipped_algorithm_count": table_style_skipped_algorithm_count,
         "figure_caption_para_count": len(figure_caption_paragraphs),
         "table_caption_para_count": len(table_caption_paragraphs),
         "display_equation_para_count": len(display_equation_paragraphs),
@@ -2580,6 +2724,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
 
     details = {
         "algorithm_table_style_id": algorithm_table_style_id,
+        "preferred_table_style_id": preferred_table_style_id,
         "algorithm_block_samples": algorithm_block_samples[:20],
         "figure_labels_repaired": figure_label_repaired,
         "table_labels_repaired": table_label_repaired,
@@ -2636,6 +2781,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     if len(inventory.figure_labels) > len(figure_caption_paragraphs):
         warnings.append(
             "figure 标签数量大于 docx 可识别图题段落数量，部分 figure 书签无法自动修复。"
+        )
+    if table_style_candidate_count > 0 and not preferred_table_style_id:
+        warnings.append(
+            "未在 reference.docx 中检测到三线表样式；表格保持 Pandoc 产出的原样式。"
         )
     if algorithm_block_skipped_count > 0:
         warnings.append(
