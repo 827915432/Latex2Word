@@ -94,6 +94,9 @@ HEADING_COMMANDS = (
 )
 
 TOKEN_PATTERN = re.compile(r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+)\}")
+EQUATION_SLOT_TOKEN_PATTERN = re.compile(
+    r"\\begin\{([^}]+)\}|\\end\{([^}]+)\}|\\label\{([^}]+)\}|(\\\[)|(\\\])"
+)
 LABEL_CMD_PATTERN = re.compile(r"\\label\s*\{([^}]+)\}")
 ALGORITHM_TITLE_PATTERN = re.compile(r"^\s*(?:algorithm|算法)\s*:", re.IGNORECASE)
 ALGORITHM_IO_PATTERN = re.compile(r"^\s*(?:input|output|输入|输出)\s*:", re.IGNORECASE)
@@ -554,37 +557,54 @@ def extract_equation_display_slots(tex_files: list[Path]) -> list[dict[str, obje
         text = _strip_comments(raw)
         stack: list[dict[str, object]] = []
 
-        for match in TOKEN_PATTERN.finditer(text):
+        for match in EQUATION_SLOT_TOKEN_PATTERN.finditer(text):
             begin_env = match.group(1)
             end_env = match.group(2)
             label = match.group(3)
+            display_bracket_begin = match.group(4)
+            display_bracket_end = match.group(5)
 
             if begin_env:
+                env_name = begin_env.strip().lower()
                 stack.append(
                     {
-                        "env": begin_env.strip().lower(),
+                        "env": env_name,
                         "labels": [],
+                        # 仅 equation（非星号）无标签时补编号；其余环境需依赖 label 编号。
+                        "numberable": env_name == "equation",
                     }
                 )
                 continue
 
-            if end_env:
-                env = end_env.strip().lower()
+            if display_bracket_begin:
+                stack.append(
+                    {
+                        "env": "display_bracket",
+                        "labels": [],
+                        # \[...\] 仅占位对齐，不参与自动编号。
+                        "numberable": False,
+                    }
+                )
+                continue
+
+            if end_env or display_bracket_end:
+                target_env = end_env.strip().lower() if end_env else "display_bracket"
                 if not stack:
                     continue
                 for pos in range(len(stack) - 1, -1, -1):
                     item = stack[pos]
-                    if item.get("env") != env:
+                    if str(item.get("env", "")) != target_env:
                         continue
                     stack = stack[:pos]
-                    if env in DISPLAY_EQUATION_ENVS:
+                    if target_env in DISPLAY_EQUATION_ENVS or target_env == "display_bracket":
                         labels = item.get("labels", [])
                         if not isinstance(labels, list):
                             labels = []
                         slots.append(
                             {
-                                "env": env,
+                                "env": target_env,
                                 "labels": _dedup_keep_order(str(v) for v in labels),
+                                "numberable": bool(item.get("numberable", False)),
                             }
                         )
                     break
@@ -598,7 +618,7 @@ def extract_equation_display_slots(tex_files: list[Path]) -> list[dict[str, obje
 
             for pos in range(len(stack) - 1, -1, -1):
                 env = str(stack[pos].get("env", ""))
-                if env not in DISPLAY_EQUATION_ENVS:
+                if env not in DISPLAY_EQUATION_ENVS and env != "display_bracket":
                     continue
                 labels = stack[pos].get("labels")
                 if not isinstance(labels, list):
@@ -2206,8 +2226,19 @@ def _build_equation_label_pairs_by_slots(
     *,
     display_equation_paragraphs: list[ET.Element],
     equation_slots: list[dict[str, object]],
-    fallback_equation_labels: list[str],
-) -> tuple[list[tuple[ET.Element, str]], dict[str, list[str]], list[ET.Element], str, list[str], int]:
+    fallback_equation_labels: list[str] | None = None,
+) -> tuple[
+    list[tuple[ET.Element, str]],
+    dict[str, list[str]],
+    list[ET.Element],
+    str,
+    list[str],
+    int,
+    list[str],
+    int,
+    int,
+    int,
+]:
     """
     基于 TeX 槽位对齐显示公式段落，生成 equation (paragraph, label) 配对。
 
@@ -2215,68 +2246,209 @@ def _build_equation_label_pairs_by_slots(
     - label_pairs
     - label_aliases_by_primary
     - number_targets（需要补 SEQ MTEqn 的公式段落）
-    - pairing_strategy: slots / fallback_zip
+    - pairing_strategy: slots / slots_resync_anchor / no_slots_skip
     - pairing_warnings
     - unlabeled_equation_numbered_count（由 `equation` 环境触发的无标签编号数量）
+    - labels_skipped_by_pairing（重同步中无法确认、被跳过的带标签槽位）
+    - numberable_slots_skipped_count（重同步中跳过的可编号无标签槽位）
+    - placeholder_slots_skipped_count（重同步中跳过的纯占位槽位）
+    - display_paragraphs_skipped_count（重同步中跳过的 docx 显示公式段落）
     """
+    _ = fallback_equation_labels
     warnings: list[str] = []
 
-    if display_equation_paragraphs and equation_slots and len(equation_slots) == len(display_equation_paragraphs):
-        pairs: list[tuple[ET.Element, str]] = []
-        alias_to_primary: dict[str, str] = {}
-        primary_labels: list[str] = []
-        number_targets: list[ET.Element] = []
-        unlabeled_equation_numbered_count = 0
+    if not equation_slots:
+        if display_equation_paragraphs:
+            warnings.append("未提取到公式槽位，已跳过公式编号与引用绑定（no_slots_skip）。")
+        return (
+            [],
+            {},
+            [],
+            "no_slots_skip",
+            warnings,
+            0,
+            [],
+            0,
+            0,
+            len(display_equation_paragraphs),
+        )
 
-        for paragraph, slot in zip(display_equation_paragraphs, equation_slots):
-            env = str(slot.get("env", "")).strip().lower()
-            raw_labels = slot.get("labels", [])
-            if isinstance(raw_labels, list):
-                dedup_labels = _dedup_keep_order(str(v) for v in raw_labels)
-            else:
-                dedup_labels = []
+    pairs: list[tuple[ET.Element, str]] = []
+    alias_to_primary: dict[str, str] = {}
+    primary_labels: list[str] = []
+    number_targets: list[ET.Element] = []
+    unlabeled_equation_numbered_count = 0
+    labels_skipped_by_pairing: list[str] = []
+    numberable_slots_skipped_count = 0
+    placeholder_slots_skipped_count = 0
+    display_paragraphs_skipped_count = 0
 
-            # 规则：
-            # 1) 任意带标签的显示公式都编号；
-            # 2) 额外对 \begin{equation}...\end{equation} 的无标签独立公式补编号。
-            should_number = bool(dedup_labels) or env == "equation"
-            if should_number:
-                number_targets.append(paragraph)
-            if env == "equation" and not dedup_labels:
-                unlabeled_equation_numbered_count += 1
+    paragraph_bookmark_sets: list[set[str]] = []
+    for paragraph in display_equation_paragraphs:
+        names: set[str] = set()
+        for node in paragraph.findall(".//w:bookmarkStart", NS):
+            name = (node.get(wqn("name"), "") or "").strip()
+            if name:
+                names.add(name)
+        paragraph_bookmark_sets.append(names)
 
-            if not dedup_labels:
+    slot_labels: list[list[str]] = []
+    slot_anchor_sets: list[set[str]] = []
+    slot_should_number: list[bool] = []
+    slot_envs: list[str] = []
+
+    for slot in equation_slots:
+        env = str(slot.get("env", "")).strip().lower()
+        raw_labels = slot.get("labels", [])
+        dedup_labels = _dedup_keep_order(str(v) for v in raw_labels) if isinstance(raw_labels, list) else []
+        anchors: set[str] = set()
+        for label in dedup_labels:
+            for anchor in _candidate_anchor_names(label):
+                anchors.add(anchor)
+
+        slot_labels.append(dedup_labels)
+        slot_anchor_sets.append(anchors)
+        # 规则：
+        # - 有标签：编号（用于引用绑定）；
+        # - 无标签：仅 numberable=true 才编号（例如 equation）；
+        # - \[...\] 槽位 numberable=false，仅占位不编号。
+        should_number = bool(dedup_labels) or bool(slot.get("numberable", False))
+        slot_should_number.append(should_number)
+        slot_envs.append(env)
+
+    slot_index = 0
+    paragraph_index = 0
+
+    while slot_index < len(equation_slots) and paragraph_index < len(display_equation_paragraphs):
+        labels = slot_labels[slot_index]
+        anchors = slot_anchor_sets[slot_index]
+        has_labels = bool(labels)
+        should_number = slot_should_number[slot_index]
+        env = slot_envs[slot_index]
+
+        remaining_slots = len(equation_slots) - slot_index
+        remaining_paragraphs = len(display_equation_paragraphs) - paragraph_index
+        current_para_anchors = paragraph_bookmark_sets[paragraph_index]
+
+        current_anchor_match = bool(anchors and (anchors & current_para_anchors))
+
+        next_labeled_slot = -1
+        next_anchor_match = False
+        for probe in range(slot_index + 1, len(equation_slots)):
+            if slot_labels[probe]:
+                next_labeled_slot = probe
+                break
+        if next_labeled_slot >= 0:
+            next_anchor_match = bool(
+                slot_anchor_sets[next_labeled_slot]
+                and (slot_anchor_sets[next_labeled_slot] & current_para_anchors)
+            )
+
+        if not has_labels and not should_number:
+            if remaining_slots > remaining_paragraphs:
+                placeholder_slots_skipped_count += 1
+                slot_index += 1
+                continue
+            slot_index += 1
+            paragraph_index += 1
+            continue
+
+        if has_labels:
+            if (not current_anchor_match) and next_anchor_match and remaining_slots > remaining_paragraphs:
+                labels_skipped_by_pairing.extend(labels)
+                slot_index += 1
                 continue
 
-            primary = dedup_labels[0]
+            if (not current_anchor_match) and remaining_paragraphs > remaining_slots:
+                display_paragraphs_skipped_count += 1
+                paragraph_index += 1
+                continue
+
+            if (not current_anchor_match) and remaining_slots > remaining_paragraphs:
+                labels_skipped_by_pairing.extend(labels)
+                slot_index += 1
+                continue
+
+            paragraph = display_equation_paragraphs[paragraph_index]
+            primary = labels[0]
             if primary not in primary_labels:
                 primary_labels.append(primary)
             pairs.append((paragraph, primary))
-
-            for alias in dedup_labels:
+            for alias in labels:
                 _bind_alias(alias_to_primary, alias=alias, primary=primary)
+            if should_number:
+                number_targets.append(paragraph)
+            slot_index += 1
+            paragraph_index += 1
+            continue
 
-        grouped_aliases = _group_aliases_by_primary(alias_to_primary, primary_labels)
-        return (
-            pairs,
-            grouped_aliases,
-            number_targets,
-            "slots",
-            warnings,
-            unlabeled_equation_numbered_count,
+        # 无标签但可编号（例如 equation）
+        if remaining_slots > remaining_paragraphs:
+            numberable_slots_skipped_count += 1
+            slot_index += 1
+            continue
+
+        paragraph = display_equation_paragraphs[paragraph_index]
+        number_targets.append(paragraph)
+        if env == "equation":
+            unlabeled_equation_numbered_count += 1
+        slot_index += 1
+        paragraph_index += 1
+
+    while slot_index < len(equation_slots):
+        labels = slot_labels[slot_index]
+        if labels:
+            labels_skipped_by_pairing.extend(labels)
+        elif slot_should_number[slot_index]:
+            numberable_slots_skipped_count += 1
+        else:
+            placeholder_slots_skipped_count += 1
+        slot_index += 1
+
+    if paragraph_index < len(display_equation_paragraphs):
+        display_paragraphs_skipped_count += len(display_equation_paragraphs) - paragraph_index
+
+    grouped_aliases = _group_aliases_by_primary(alias_to_primary, primary_labels)
+    strategy = (
+        "slots"
+        if (
+            len(equation_slots) == len(display_equation_paragraphs)
+            and not labels_skipped_by_pairing
+            and numberable_slots_skipped_count == 0
+            and placeholder_slots_skipped_count == 0
+            and display_paragraphs_skipped_count == 0
+        )
+        else "slots_resync_anchor"
+    )
+
+    if strategy == "slots_resync_anchor":
+        warnings.append(
+            "公式槽位与 docx 显示公式段落不完全一致，已采用槽位重同步+锚点优先配对（slots_resync_anchor）。"
+        )
+    if labels_skipped_by_pairing:
+        warnings.append(
+            f"公式槽位重同步中跳过 {len(_dedup_keep_order(labels_skipped_by_pairing))} 个带标签槽位（无法确认锚点）。"
+        )
+    if numberable_slots_skipped_count > 0:
+        warnings.append(
+            f"公式槽位重同步中跳过 {numberable_slots_skipped_count} 个可编号无标签槽位（无法确认对应显示段落）。"
+        )
+    if display_paragraphs_skipped_count > 0:
+        warnings.append(
+            f"公式槽位重同步中跳过 {display_paragraphs_skipped_count} 个 docx 显示公式段落（未能匹配到可信槽位）。"
         )
 
-    warnings.append(
-        "公式槽位数与 docx 显示公式段落数不一致，已回退到顺序配对（fallback_zip）。"
-    )
-    fallback_pairs = list(zip(display_equation_paragraphs, fallback_equation_labels))
     return (
-        fallback_pairs,
-        {},
-        [paragraph for paragraph, _label in fallback_pairs],
-        "fallback_zip",
+        pairs,
+        grouped_aliases,
+        number_targets,
+        strategy,
         warnings,
-        0,
+        unlabeled_equation_numbered_count,
+        _dedup_keep_order(labels_skipped_by_pairing),
+        numberable_slots_skipped_count,
+        placeholder_slots_skipped_count,
+        display_paragraphs_skipped_count,
     )
 
 
@@ -2702,6 +2874,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         equation_pairing_strategy,
         equation_pairing_warnings,
         equation_unlabeled_equation_numbered_count,
+        equation_labels_skipped_by_pairing,
+        equation_numberable_slots_skipped_count,
+        equation_placeholder_slots_skipped_count,
+        equation_display_paragraphs_skipped_count,
     ) = _build_equation_label_pairs_by_slots(
         display_equation_paragraphs=display_equation_paragraphs,
         equation_slots=equation_slots,
@@ -3033,6 +3209,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "figure_pairing_warning_count": len(figure_pairing_warnings),
         "table_pairing_warning_count": len(table_pairing_warnings),
         "equation_pairing_warning_count": len(equation_pairing_warnings),
+        "equation_labels_skipped_by_pairing_count": len(equation_labels_skipped_by_pairing),
+        "equation_numberable_slots_skipped_count": equation_numberable_slots_skipped_count,
+        "equation_placeholder_slots_skipped_count": equation_placeholder_slots_skipped_count,
+        "equation_display_paragraphs_skipped_count": equation_display_paragraphs_skipped_count,
         "paragraph_pairing_warning_count": len(paragraph_pairing_warnings),
         "paragraph_labels_skipped_by_pairing_count": len(paragraph_labels_skipped_by_pairing),
         "figure_caption_seq_added": figure_seq_added,
@@ -3123,6 +3303,10 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "paragraph_num_bookmark_added": paragraph_num_bookmark_added,
         "equation_pairing_strategy": equation_pairing_strategy,
         "equation_pairing_warnings": equation_pairing_warnings[:20],
+        "equation_labels_skipped_by_pairing": equation_labels_skipped_by_pairing[:50],
+        "equation_numberable_slots_skipped_count": equation_numberable_slots_skipped_count,
+        "equation_placeholder_slots_skipped_count": equation_placeholder_slots_skipped_count,
+        "equation_display_paragraphs_skipped_count": equation_display_paragraphs_skipped_count,
         "paragraph_pairing_strategy": paragraph_pairing_strategy,
         "paragraph_pairing_warnings": paragraph_pairing_warnings[:20],
         "paragraph_labels_skipped_by_pairing": paragraph_labels_skipped_by_pairing[:50],
