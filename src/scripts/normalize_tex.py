@@ -1124,6 +1124,246 @@ def normalize_align_leading_labels(text: str, file_path: Path, root: Path) -> tu
     return new_text, actions
 
 
+def _split_top_level_align_rows(body: str) -> Optional[list[str]]:
+    """
+    仅在顶层分割 align 行（按 ``\\\\``），避免误切分嵌套环境内部的换行。
+
+    返回 None 表示结构不稳定（如括号或 begin/end 栈不平衡）。
+    """
+    rows: list[str] = []
+    start = 0
+    i = 0
+    brace_depth = 0
+    env_stack: list[str] = []
+
+    begin_end_pattern = re.compile(r"\\(begin|end)\s*\{([^{}]+)\}")
+
+    while i < len(body):
+        ch = body[i]
+
+        # 跳过注释，避免注释中的反斜杠影响解析。
+        if ch == "%":
+            newline_pos = body.find("\n", i)
+            if newline_pos == -1:
+                break
+            i = newline_pos + 1
+            continue
+
+        if ch == "\\":
+            command_match = begin_end_pattern.match(body, i)
+            if command_match:
+                command_type = command_match.group(1)
+                env_name = command_match.group(2).strip()
+                if command_type == "begin":
+                    env_stack.append(env_name)
+                else:
+                    if env_stack and env_stack[-1] == env_name:
+                        env_stack.pop()
+                    elif env_name in env_stack:
+                        # 保守对齐：遇到不完全匹配时也尽量恢复栈。
+                        env_stack.remove(env_name)
+                i = command_match.end()
+                continue
+
+            if i + 1 < len(body) and body[i + 1] == "\\" and brace_depth == 0 and not env_stack:
+                row_end = i + 2
+                optional_pos = skip_whitespace(body, row_end)
+                if optional_pos < len(body) and body[optional_pos] == "[":
+                    bracket_end = parse_balanced_group(body, optional_pos, "[", "]")
+                    if bracket_end is None:
+                        return None
+                    row_end = bracket_end
+                rows.append(body[start:i])
+                start = row_end
+                i = row_end
+                continue
+
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            if brace_depth == 0:
+                return None
+            brace_depth -= 1
+
+        i += 1
+
+    if brace_depth != 0 or env_stack:
+        return None
+
+    rows.append(body[start:])
+    return rows
+
+
+def _wrap_align_row_as_display_math(row_math: str) -> str:
+    """
+    将一行 align 数学体包装为可独立显示的数学块内容。
+    """
+    stripped = row_math.strip()
+    if "&" in stripped:
+        return "\n".join(
+            [
+                r"\begin{aligned}",
+                stripped,
+                r"\end{aligned}",
+            ]
+        )
+    return stripped
+
+
+def split_multilabel_align_into_equations(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
+    """
+    将 ``align / align*`` 中“多 label”场景拆分为独立显示公式。
+
+    规则：
+    - 仅在同一 align 环境内检测到 >=2 个 ``\\label`` 时触发；
+    - 每个带 label 的行改写为独立 ``equation``（保留 label）；
+    - 不带 label 的行改写为不编号显示块 ``\\[ ... \\]``；
+    - 遇到 ``\\tag`` / ``\\intertext`` 等复杂结构时保守跳过并记录 WARN。
+    """
+    actions: list[ActionRecord] = []
+    align_env_pattern = re.compile(
+        r"\\begin\{(?P<env>align\*?)\}(?P<body>.*?)\\end\{(?P=env)\}",
+        re.DOTALL,
+    )
+
+    def repl(match: re.Match) -> str:
+        env_name = match.group("env")
+        body = match.group("body")
+        line_no = line_number_from_offset(text, match.start())
+
+        all_labels = _find_command_occurrences_with_payload(body, "label")
+        if len(all_labels) <= 1:
+            return match.group(0)
+
+        if re.search(r"\\(?:intertext|shortintertext|tag\*?)\b", body):
+            actions.append(
+                ActionRecord(
+                    action_type="skip_split_multilabel_align",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="检测到多 label 的 align 环境，但包含 \\tag/\\intertext 等复杂结构，已跳过自动拆分。",
+                    details={
+                        "environment": env_name,
+                        "label_count": len(all_labels),
+                        "reason": "complex_tag_or_intertext",
+                    },
+                )
+            )
+            return match.group(0)
+
+        rows = _split_top_level_align_rows(body)
+        if rows is None or len(rows) <= 1:
+            actions.append(
+                ActionRecord(
+                    action_type="skip_split_multilabel_align",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="检测到多 label 的 align 环境，但行级结构不稳定，已跳过自动拆分。",
+                    details={
+                        "environment": env_name,
+                        "label_count": len(all_labels),
+                        "reason": "rows_parse_failed",
+                    },
+                )
+            )
+            return match.group(0)
+
+        converted_blocks: list[str] = []
+        converted_labeled_rows = 0
+        converted_unlabeled_rows = 0
+        row_idx = 0
+
+        for row in rows:
+            row_idx += 1
+            if not row.strip():
+                continue
+
+            row_labels = _find_command_occurrences_with_payload(row, "label")
+            if len(row_labels) > 1:
+                actions.append(
+                    ActionRecord(
+                        action_type="skip_split_multilabel_align",
+                        severity=SEVERITY_WARN,
+                        file=safe_relative(file_path, root),
+                        line=line_no,
+                        message="检测到同一 align 行内存在多个 label，已跳过自动拆分。",
+                        details={
+                            "environment": env_name,
+                            "label_count": len(all_labels),
+                            "reason": "multiple_labels_in_single_row",
+                            "row_index": row_idx,
+                        },
+                    )
+                )
+                return match.group(0)
+
+            spans_to_remove = [(start, end) for start, end, _payload in row_labels]
+            labels = [payload for _start, _end, payload in row_labels if payload]
+            row_without_label = _remove_spans_from_text(row, spans_to_remove)
+            row_without_label = re.sub(r"\\(?:notag|nonumber)\b", "", row_without_label)
+            row_math = row_without_label.strip()
+
+            if not row_math:
+                if labels:
+                    actions.append(
+                        ActionRecord(
+                            action_type="skip_split_multilabel_align",
+                            severity=SEVERITY_WARN,
+                            file=safe_relative(file_path, root),
+                            line=line_no,
+                            message="检测到 label 行缺少可提取的公式体，已跳过自动拆分。",
+                            details={
+                                "environment": env_name,
+                                "label_count": len(all_labels),
+                                "reason": "label_without_math_body",
+                                "row_index": row_idx,
+                                "labels": labels,
+                            },
+                        )
+                    )
+                    return match.group(0)
+                continue
+
+            display_body = _wrap_align_row_as_display_math(row_math)
+
+            if labels:
+                block_lines = [r"\begin{equation}", display_body]
+                for label in labels:
+                    block_lines.append(f"\\label{{{label}}}")
+                block_lines.append(r"\end{equation}")
+                converted_blocks.append("\n".join(block_lines))
+                converted_labeled_rows += 1
+            else:
+                block_lines = [r"\[", display_body, r"\]"]
+                converted_blocks.append("\n".join(block_lines))
+                converted_unlabeled_rows += 1
+
+        if converted_labeled_rows < 2:
+            return match.group(0)
+
+        actions.append(
+            ActionRecord(
+                action_type="split_multilabel_align_into_equations",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将多 label 的 align 环境按行拆分为独立显示公式，以避免 Word 端标签丢失。",
+                details={
+                    "environment": env_name,
+                    "label_count": len(all_labels),
+                    "converted_labeled_rows": converted_labeled_rows,
+                    "converted_unlabeled_rows": converted_unlabeled_rows,
+                },
+            )
+        )
+        return "\n\n".join(converted_blocks)
+
+    new_text = align_env_pattern.sub(repl, text)
+    return new_text, actions
+
+
 def normalize_legacy_math_commands(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
     """
     在数学上下文中规范化旧式命令，提升 Pandoc 数学解析稳定性。
@@ -1983,12 +2223,13 @@ def process_tex_file(
     4. 规范化单图 figure 中 includegraphics 行尾换行命令
     5. 规范化扩展交叉引用
     6. 规范化 align 系环境中的行首 label 位置
-    7. 规范化数学上下文中的旧式命令
-    8. 降级 subfloat / subfigure 包装
-    9. 调整 float 中 caption / label 顺序
-    10. 将 table* 环境降级为 table
-    11. 将 algorithm 环境降级为 Pandoc 稳定块结构
-    12. 展开安全零参数宏
+    7. 将多 label 的 align 按行拆分为独立显示公式
+    8. 规范化数学上下文中的旧式命令
+    9. 降级 subfloat / subfigure 包装
+    10. 调整 float 中 caption / label 顺序
+    11. 将 table* 环境降级为 table
+    12. 将 algorithm 环境降级为 Pandoc 稳定块结构
+    13. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -2016,6 +2257,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = normalize_align_leading_labels(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = split_multilabel_align_into_equations(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = normalize_legacy_math_commands(text, file_path, work_root)
