@@ -1126,7 +1126,11 @@ def _normalize_for_search(text: str) -> str:
     return re.sub(r"[\s\\{}()\[\],.:;，。；：“”‘’\"'`~!@#$%^&*+=<>/?|-]+", "", lowered)
 
 
-def _find_source_line_by_evidence(index: TexIndex, evidence_text: str) -> Optional[TextHit]:
+def _find_source_line_by_evidence(
+    index: TexIndex,
+    evidence_text: str,
+    preferred_file: Optional[str] = None,
+) -> Optional[TextHit]:
     """
     通过短证据文本在 TeX 中反查行号（用于图片 caption 等弱锚点场景）。
     """
@@ -1144,7 +1148,12 @@ def _find_source_line_by_evidence(index: TexIndex, evidence_text: str) -> Option
         if tail and tail not in candidates:
             candidates.append(tail)
 
-    for file_path, lines in index.lines_by_file.items():
+    ordered_files = list(index.lines_by_file.keys())
+    if preferred_file and preferred_file in index.lines_by_file:
+        ordered_files = [preferred_file] + [f for f in ordered_files if f != preferred_file]
+
+    for file_path in ordered_files:
+        lines = index.lines_by_file.get(file_path, [])
         for i, raw_line in enumerate(lines, start=1):
             line = _normalize_for_search(_strip_tex_comment(raw_line))
             if not line:
@@ -1273,7 +1282,7 @@ def _infer_source_hit(item: dict, index: TexIndex, main_tex: Optional[str], anch
     if hit is not None:
         return hit, True
 
-    anchor_hit = _find_source_line_by_evidence(index, anchor)
+    anchor_hit = _find_source_line_by_evidence(index, anchor, preferred_file=main_tex)
     if anchor_hit is not None:
         return anchor_hit, True
 
@@ -1294,7 +1303,7 @@ def _infer_source_hit(item: dict, index: TexIndex, main_tex: Optional[str], anch
         if isinstance(first, dict):
             hint = str(first.get("next_paragraph_text", "") or first.get("paragraph_text", "")).strip()
             if hint:
-                hint_hit = _find_source_line_by_evidence(index, hint)
+                hint_hit = _find_source_line_by_evidence(index, hint, preferred_file=main_tex)
                 if hint_hit is not None:
                     return hint_hit, True
 
@@ -1508,8 +1517,97 @@ def enrich_items_for_user_view(
         item["verify_action"] = derive_verify_action(item)
         item["estimated_time"] = estimate_fix_minutes(item)
         item["evidence_short"] = primary.get("evidence", "")
+        item["expanded_problem_locations"] = build_expanded_problem_locations(
+            item=item,
+            index=index,
+            main_tex=main_tex,
+        )
         enriched.append(item)
     return enriched
+
+
+def build_expanded_problem_locations(
+    *,
+    item: dict,
+    index: TexIndex,
+    main_tex: Optional[str],
+) -> list[str]:
+    """
+    为“多对象问题”生成逐条定位清单，避免只显示第一个示例。
+    """
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    entries: list[str] = []
+
+    unsupported_examples = details.get("unsupported_image_examples")
+    if isinstance(unsupported_examples, list) and unsupported_examples:
+        for raw in unsupported_examples:
+            if not isinstance(raw, dict):
+                continue
+            rid = str(raw.get("rid", "")).strip()
+            target = str(raw.get("target", "")).strip()
+            para_idx = raw.get("paragraph_index")
+            para_hint = str(raw.get("next_paragraph_text", "") or raw.get("paragraph_text", "")).strip()
+
+            source_hit = None
+            if para_hint:
+                source_hit = _find_source_line_by_evidence(index, para_hint, preferred_file=main_tex)
+            if source_hit is not None:
+                source_text = f"{source_hit.file}:{source_hit.line}"
+                heading = _find_heading_for_hit(index, source_hit)
+            else:
+                source_text = f"{main_tex}:1" if main_tex else "N/A"
+                heading = None
+
+            word_parts: list[str] = []
+            if heading:
+                word_parts.append(f"§{heading}")
+            if isinstance(para_idx, int):
+                word_parts.append(f"para#{para_idx}")
+            if para_hint:
+                word_parts.append(shorten_for_line(para_hint, 30))
+            word_text = " | ".join(word_parts) if word_parts else "N/A"
+
+            anchor = rid or target or "N/A"
+            evidence = shorten_for_line(target or para_hint or anchor, 40)
+            entries.append(
+                format_primary_location(
+                    {
+                        "source": source_text,
+                        "word": word_text,
+                        "anchor": anchor,
+                        "evidence": evidence,
+                    }
+                )
+            )
+        return entries
+
+    anchors = details.get("anchors")
+    if isinstance(anchors, list) and len(anchors) > 1:
+        for anchor_raw in anchors:
+            anchor = str(anchor_raw).strip()
+            if not anchor:
+                continue
+            source_hit, _ = _infer_source_hit(item, index, main_tex, anchor)
+            if source_hit is not None:
+                source_text = f"{source_hit.file}:{source_hit.line}"
+                heading = _find_heading_for_hit(index, source_hit)
+                evidence = shorten_for_line(source_hit.snippet or anchor, 40)
+            else:
+                source_text = f"{main_tex}:1" if main_tex else "N/A"
+                heading = None
+                evidence = shorten_for_line(anchor, 40)
+            word_text = f"§{heading}" if heading else "N/A"
+            entries.append(
+                format_primary_location(
+                    {
+                        "source": source_text,
+                        "word": word_text,
+                        "anchor": anchor,
+                        "evidence": evidence,
+                    }
+                )
+            )
+    return entries
 
 
 # -----------------------------------------------------------------------------
@@ -2020,23 +2118,20 @@ def items_from_postcheck(postcheck_report: Optional[dict]) -> list[ChecklistItem
             format_text = ", ".join(str(item) for item in unsupported_formats if str(item).strip()) or "PDF/EPS"
 
             unsupported_ref_count = int(details.get("unsupported_reference_count_in_body", 0) or 0)
-            unsupported_examples = format_unrenderable_image_examples(details, limit=8)
-            example_text = "；".join(unsupported_examples)
+            unsupported_examples = format_unrenderable_image_examples(details, limit=200)
 
             issue_summary = (
                 f"后检查发现 {unsupported_ref_count} 处图片引用关联到 {format_text}，"
                 "Word 通常不会渲染这类内嵌图片。"
             )
-            if example_text:
-                issue_summary += f" 已定位对象：{example_text}"
+            if unsupported_examples:
+                issue_summary += " 具体对象请见本卡片“问题清单”。"
 
             recommended_actions = [
                 "根据清单中的对象定位到源图，优先将 PDF/EPS 转为 PNG/JPG/EMF 等可渲染格式。",
                 "替换后重新运行 convert -> postcheck -> checklist，确认该告警已消失。",
                 "若暂时不能回源替换，请在 Word 中手工重插对应图片并复核题注与文内引用。",
             ]
-            if unsupported_examples:
-                recommended_actions.append(f"优先处理这些对象：{'; '.join(unsupported_examples)}")
 
             items.append(
                 make_item(
@@ -2448,8 +2543,13 @@ def render_markdown_report(report: ManualFixChecklistReport) -> str:
     else:
         for item in items:
             lines.append(f"### {item.get('item_id', '')} | P{item.get('priority', '')} | {item.get('title', '')}")
-            lines.append(f"问题：{item.get('problem_short', item.get('title', ''))}")
+            lines.append(f"问题：{item.get('issue_summary', item.get('title', ''))}")
             lines.append(f"定位：Primary Location: {item.get('primary_location_text', 'N/A')}")
+            expanded = item.get("expanded_problem_locations")
+            if isinstance(expanded, list) and expanded:
+                lines.append("问题清单：")
+                for idx, entry in enumerate(expanded, start=1):
+                    lines.append(f"{idx}. {entry}")
             lines.append(f"修复动作：{item.get('fix_action', '修改对应对象并重转。')}")
             lines.append(f"验证动作：{item.get('verify_action', '更新字段并核对该问题。')}")
             lines.append(f"证据：{item.get('evidence_short', '')}")
