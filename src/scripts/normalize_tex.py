@@ -27,8 +27,9 @@ normalize_tex.py
 8. 在 figure / table 环境中，当检测到“\\label 紧邻且位于 \\caption 前”时，
    将其调整为“\\caption 后紧跟 \\label”；
 9. 将 ``table*`` 环境保守降级为 ``table``（保留内容与可选参数不变）；
-10. 将 ``algorithm / algorithm*``（含 algorithm2e 语法）降级为 Pandoc 稳定块结构；
-11. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
+10. 在单图 figure 环境中移除 ``\\includegraphics`` 行尾 ``\\``（避免 Pandoc 将单图降级为表格结构）；
+11. 将 ``algorithm / algorithm*``（含 algorithm2e 语法）降级为 Pandoc 稳定块结构；
+12. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
    - 支持 \\newcommand / \\renewcommand / \\providecommand
    - 仅展开零参数、短小、无参数占位符的定义
    - 不覆盖原定义，只在正文使用位置做文本替换
@@ -899,6 +900,75 @@ def add_bibliography_extensions(text: str, file_path: Path, root: Path) -> tuple
     text = addbib_pattern.sub(addbib_repl, text)
     text = bibliography_pattern.sub(bibliography_repl, text)
     return text, actions
+
+
+def normalize_single_figure_includegraphics_linebreaks(
+    text: str,
+    file_path: Path,
+    root: Path,
+) -> tuple[str, list[ActionRecord]]:
+    """
+    在单图 figure 环境中，移除 ``\\includegraphics`` 行尾 ``\\\\``。
+
+    背景：
+    - 部分工程会写成 ``\\includegraphics{...}\\\\``；
+    - Pandoc 对这类结构可能输出为表格包裹，导致“单张图进了表格”。
+
+    保守策略：
+    1. 仅处理 ``figure / figure*``；
+    2. 仅处理“环境内恰好 1 个 \\includegraphics”的情况；
+    3. 若检测到 ``\\subfloat`` / ``\\subfigure``，直接跳过；
+    4. 仅移除图片命令行末尾的 ``\\\\``（含 ``\\\\[...]``），不改其他内容。
+    """
+    actions: list[ActionRecord] = []
+
+    figure_pattern = re.compile(
+        r"\\begin\{(?P<env>figure\*?)\}(?P<body>.*?)\\end\{(?P=env)\}",
+        re.DOTALL,
+    )
+    includegraphics_pattern = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{[^}]+\}")
+    includegraphics_linebreak_pattern = re.compile(
+        r"(?m)^(?P<line>[^\n]*\\includegraphics(?:\[[^\]]*\])?\{[^}]+\}[ \t]*)"
+        r"\\\\(?:\[[^\]]*\])?(?P<trail>[ \t]*(?:%[^\n]*)?)$"
+    )
+
+    def repl(match: re.Match) -> str:
+        nonlocal actions
+        env_name = match.group("env")
+        body = match.group("body")
+
+        # 子图包装会在后续单独降级，避免在这里误改子图布局细节。
+        if re.search(r"\\(?:subfloat|subfigure)\b", body):
+            return match.group(0)
+
+        includegraphics_matches = list(includegraphics_pattern.finditer(body))
+        if len(includegraphics_matches) != 1:
+            return match.group(0)
+
+        body_base_offset = match.start("body")
+
+        def linebreak_repl(lb_match: re.Match) -> str:
+            nonlocal actions
+            line_no = line_number_from_offset(text, body_base_offset + lb_match.start())
+            actions.append(
+                ActionRecord(
+                    action_type="normalize_single_figure_includegraphics_linebreak",
+                    severity=SEVERITY_INFO,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="在单图 figure 环境中移除 includegraphics 行尾换行命令。",
+                    details={"environment": env_name, "reason": "avoid_pandoc_single_image_table_wrapper"},
+                )
+            )
+            return f"{lb_match.group('line')}{lb_match.group('trail')}"
+
+        new_body, replaced = includegraphics_linebreak_pattern.subn(linebreak_repl, body, count=1)
+        if replaced == 0:
+            return match.group(0)
+        return f"\\begin{{{env_name}}}{new_body}\\end{{{env_name}}}"
+
+    new_text = figure_pattern.sub(repl, text)
+    return new_text, actions
 
 
 def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str, list[ActionRecord]]:
@@ -1910,14 +1980,15 @@ def process_tex_file(
     1. 统一换行
     2. 补全图片扩展名
     3. 补全 bib 扩展名
-    4. 规范化扩展交叉引用
-    5. 规范化 align 系环境中的行首 label 位置
-    6. 规范化数学上下文中的旧式命令
-    7. 降级 subfloat / subfigure 包装
-    8. 调整 float 中 caption / label 顺序
-    9. 将 table* 环境降级为 table
-    10. 将 algorithm 环境降级为 Pandoc 稳定块结构
-    11. 展开安全零参数宏
+    4. 规范化单图 figure 中 includegraphics 行尾换行命令
+    5. 规范化扩展交叉引用
+    6. 规范化 align 系环境中的行首 label 位置
+    7. 规范化数学上下文中的旧式命令
+    8. 降级 subfloat / subfigure 包装
+    9. 调整 float 中 caption / label 顺序
+    10. 将 table* 环境降级为 table
+    11. 将 algorithm 环境降级为 Pandoc 稳定块结构
+    12. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -1936,6 +2007,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = add_bibliography_extensions(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = normalize_single_figure_includegraphics_linebreaks(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = normalize_extended_refs(text, file_path, work_root)
@@ -2560,6 +2634,9 @@ def main() -> int:
 
     if any(action.action_type == "reorder_label_after_caption" for action in action_log):
         recommendations.append("float 中的 caption/label 顺序已部分规范化，有利于后续引用恢复。")
+
+    if any(action.action_type == "normalize_single_figure_includegraphics_linebreak" for action in action_log):
+        recommendations.append("已移除部分单图 figure 中 includegraphics 行尾的 \\\\，以降低 Pandoc 将单图包裹为表格的概率。")
 
     if any(action.action_type == "expand_zero_arg_macro" for action in action_log):
         recommendations.append("部分零参数宏已展开；若正文存在复杂自定义命令，仍需在后续阶段重点复核。")
