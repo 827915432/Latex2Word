@@ -29,11 +29,13 @@ normalize_tex.py
 9. 将 ``table*`` 环境保守降级为 ``table``（保留内容与可选参数不变）；
 10. 在单图 figure 环境中移除 ``\\includegraphics`` 行尾 ``\\``（避免 Pandoc 将单图降级为表格结构）；
 11. 将 ``algorithm / algorithm*``（含 algorithm2e 语法）降级为 Pandoc 稳定块结构；
-12. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
+12. 当 ``definition/theorem/lemma/...`` 环境内部包含显示公式时，
+    自动降级解包为普通块文本（保留原显示公式块）；
+13. 安全展开“零参数且不含 # 占位符”的简单自定义命令：
    - 支持 \\newcommand / \\renewcommand / \\providecommand
    - 仅展开零参数、短小、无参数占位符的定义
    - 不覆盖原定义，只在正文使用位置做文本替换
-12. 生成结构化 JSON 报告与 Markdown 报告。
+14. 生成结构化 JSON 报告与 Markdown 报告。
 
 设计边界
 --------
@@ -42,7 +44,7 @@ normalize_tex.py
 2. 不重构章节结构；
 3. 不删除用户内容；
 4. 不做激进宏展开；
-5. 不尝试自动修复复杂 TikZ、复杂表格、复杂 theorem 系统；
+5. 不尝试自动修复复杂 TikZ、复杂表格、复杂 theorem 系统（仅做含显示公式的 theorem-like 保守解包）；
 6. 不直接调用 Pandoc；
 7. 不修改原始工程。
 
@@ -144,6 +146,37 @@ MATH_BLOCK_ENV_NAMES = (
     "eqnarray",
     "eqnarray*",
 )
+THEOREM_LIKE_ENV_NAMES = (
+    "definition",
+    "definition*",
+    "theorem",
+    "theorem*",
+    "lemma",
+    "lemma*",
+    "proposition",
+    "proposition*",
+    "corollary",
+    "corollary*",
+    "remark",
+    "remark*",
+    "example",
+    "example*",
+    "assumption",
+    "assumption*",
+    "property",
+    "property*",
+)
+THEOREM_LIKE_ENV_DISPLAY_TITLES = {
+    "definition": "Definition",
+    "theorem": "Theorem",
+    "lemma": "Lemma",
+    "proposition": "Proposition",
+    "corollary": "Corollary",
+    "remark": "Remark",
+    "example": "Example",
+    "assumption": "Assumption",
+    "property": "Property",
+}
 
 # 默认忽略复制的目录/文件名。
 # 这些内容对 LaTeX -> Word 主流程没有帮助，反而会污染工作副本。
@@ -1999,6 +2032,176 @@ def downgrade_algorithm_environments(text: str, file_path: Path, root: Path) -> 
     return new_text, actions
 
 
+def _theorem_like_body_contains_display_math(body: str) -> bool:
+    """
+    判断 theorem-like 环境正文是否包含“显示公式块”。
+
+    命中规则：
+    - 常见显示数学环境（equation/align/gather/...）
+    - ``\\[ ... \\]``
+    - ``$$ ... $$``
+    """
+    env_names = "|".join(re.escape(item) for item in MATH_BLOCK_ENV_NAMES)
+    if re.search(rf"\\begin\s*\{{\s*(?:{env_names})\s*\}}", body):
+        return True
+    if re.search(r"\\\[", body):
+        return True
+    if re.search(r"(?<!\\)\$\$", body):
+        return True
+    return False
+
+
+def _theorem_like_heading(env_name: str, optional_title: Optional[str]) -> str:
+    """
+    生成 theorem-like 降级后的人类可读标题。
+    """
+    base_name = env_name[:-1] if env_name.endswith("*") else env_name
+    base_title = THEOREM_LIKE_ENV_DISPLAY_TITLES.get(base_name, base_name.title())
+    if optional_title:
+        return f"{base_title} ({optional_title})"
+    return base_title
+
+
+def downgrade_theorem_like_environments_with_display_math(
+    text: str,
+    file_path: Path,
+    root: Path,
+) -> tuple[str, list[ActionRecord]]:
+    """
+    在 theorem-like 环境内部检测到显示公式时，保守降级为普通块文本。
+
+    目标：
+    - 保留原公式块（equation/align/\\[...\\] 等）不变；
+    - 去除 theorem-like 外壳，减少 Pandoc 对“定理块+显示公式”混排的不稳定输出；
+    - 将 theorem-like 标题降级为普通加粗行，便于 Word 侧保留阅读结构。
+    """
+    actions: list[ActionRecord] = []
+    env_names_pattern = "|".join(re.escape(name) for name in THEOREM_LIKE_ENV_NAMES)
+    begin_pattern = re.compile(
+        rf"\\begin\s*\{{\s*(?P<env>{env_names_pattern})\s*\}}"
+    )
+
+    parts: list[str] = []
+    cursor = 0
+    search_pos = 0
+    modified = False
+
+    while True:
+        begin_match = begin_pattern.search(text, search_pos)
+        if not begin_match:
+            break
+
+        env_name = begin_match.group("env")
+        begin_start = begin_match.start()
+        begin_end = begin_match.end()
+        body_start = begin_end
+        optional_title: Optional[str] = None
+
+        optional_start = skip_whitespace(text, begin_end)
+        if optional_start < len(text) and text[optional_start] == "[":
+            optional_end = parse_balanced_group(text, optional_start, "[", "]")
+            if optional_end is None:
+                line_no = line_number_from_offset(text, begin_start)
+                actions.append(
+                    ActionRecord(
+                        action_type="skip_downgrade_theorem_like_environment",
+                        severity=SEVERITY_WARN,
+                        file=safe_relative(file_path, root),
+                        line=line_no,
+                        message="theorem-like 环境可选标题括号不平衡，已跳过自动降级。",
+                        details={
+                            "environment": env_name,
+                            "reason": "optional_title_unbalanced",
+                        },
+                    )
+                )
+                search_pos = begin_end
+                continue
+            optional_title = text[optional_start + 1 : optional_end - 1].strip()
+            body_start = optional_end
+
+        token_pattern = re.compile(
+            rf"\\(?P<kind>begin|end)\s*\{{\s*{re.escape(env_name)}\s*\}}"
+        )
+        depth = 1
+        token_search_pos = body_start
+        env_end_start: Optional[int] = None
+        env_end_end: Optional[int] = None
+
+        while True:
+            token_match = token_pattern.search(text, token_search_pos)
+            if not token_match:
+                break
+            if token_match.group("kind") == "begin":
+                depth += 1
+            else:
+                depth -= 1
+            token_search_pos = token_match.end()
+            if depth == 0:
+                env_end_start = token_match.start()
+                env_end_end = token_match.end()
+                break
+
+        if env_end_start is None or env_end_end is None:
+            line_no = line_number_from_offset(text, begin_start)
+            actions.append(
+                ActionRecord(
+                    action_type="skip_downgrade_theorem_like_environment",
+                    severity=SEVERITY_WARN,
+                    file=safe_relative(file_path, root),
+                    line=line_no,
+                    message="theorem-like 环境 begin/end 不成对，已跳过自动降级。",
+                    details={
+                        "environment": env_name,
+                        "reason": "begin_end_unbalanced",
+                    },
+                )
+            )
+            search_pos = begin_end
+            continue
+
+        body = text[body_start:env_end_start]
+        if not _theorem_like_body_contains_display_math(body):
+            search_pos = env_end_end
+            continue
+
+        heading_text = _theorem_like_heading(env_name, optional_title)
+        heading_line = f"\\noindent\\textbf{{{heading_text}:}}"
+        body_content = body.strip("\n")
+        replacement_parts = [heading_line]
+        if body_content:
+            replacement_parts.extend(["", body_content])
+        replacement = "\n".join(replacement_parts)
+
+        parts.append(text[cursor:begin_start])
+        parts.append(replacement)
+        cursor = env_end_end
+        search_pos = env_end_end
+        modified = True
+
+        line_no = line_number_from_offset(text, begin_start)
+        actions.append(
+            ActionRecord(
+                action_type="downgrade_theorem_like_environment_with_display_math",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将含显示公式的 theorem-like 环境降级为普通块文本，以提升 Pandoc 显示公式段落稳定性。",
+                details={
+                    "environment": env_name,
+                    "optional_title_preserved": bool(optional_title),
+                    "heading_text": heading_text,
+                },
+            )
+        )
+
+    if not modified:
+        return text, actions
+
+    parts.append(text[cursor:])
+    return "".join(parts), actions
+
+
 def find_first_command_span(text: str, command_name: str) -> Optional[tuple[int, int]]:
     """
     在一段文本中查找第一个类似 \\command[optional]{mandatory} 的命令区间。
@@ -2225,11 +2428,12 @@ def process_tex_file(
     6. 规范化 align 系环境中的行首 label 位置
     7. 将多 label 的 align 按行拆分为独立显示公式
     8. 规范化数学上下文中的旧式命令
-    9. 降级 subfloat / subfigure 包装
-    10. 调整 float 中 caption / label 顺序
-    11. 将 table* 环境降级为 table
-    12. 将 algorithm 环境降级为 Pandoc 稳定块结构
-    13. 展开安全零参数宏
+    9. 将含显示公式的 theorem-like 环境降级为普通块文本
+    10. 降级 subfloat / subfigure 包装
+    11. 调整 float 中 caption / label 顺序
+    12. 将 table* 环境降级为 table
+    13. 将 algorithm 环境降级为 Pandoc 稳定块结构
+    14. 展开安全零参数宏
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -2263,6 +2467,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = normalize_legacy_math_commands(text, file_path, work_root)
+    actions.extend(file_actions)
+
+    text, file_actions = downgrade_theorem_like_environments_with_display_math(text, file_path, work_root)
     actions.extend(file_actions)
 
     text, file_actions = downgrade_subfloat_wrappers(text, file_path, work_root)
@@ -2887,6 +3094,9 @@ def main() -> int:
 
     if any(action.action_type == "downgrade_algorithm_environment" for action in action_log):
         recommendations.append("algorithm 环境已降级为块级结构；请在 Word 中复核伪代码标题、步骤换行与引用文本。")
+
+    if any(action.action_type == "downgrade_theorem_like_environment_with_display_math" for action in action_log):
+        recommendations.append("含显示公式的 theorem-like 环境已降级解包；请在 Word 中复核定义/定理标题样式与段间距。")
 
     if any(action.action_type.startswith("skip_") for action in action_log):
         recommendations.append("存在被跳过的复杂宏定义；这些对象不应被视为已自动处理。")
