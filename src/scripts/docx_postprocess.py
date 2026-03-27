@@ -1097,6 +1097,21 @@ def _make_instr_text_run(instr_text: str) -> ET.Element:
     return run
 
 
+def _field_char_type(node: ET.Element) -> str:
+    if node.tag != wqn("r"):
+        return ""
+    fld_char = node.find("./w:fldChar", NS)
+    if fld_char is None:
+        return ""
+    return (fld_char.get(wqn("fldCharType"), "") or "").strip().lower()
+
+
+def _run_instr_text(run: ET.Element) -> str:
+    if run.tag != wqn("r"):
+        return ""
+    return "".join((node.text or "") for node in run.findall("./w:instrText", NS))
+
+
 def _build_simple_ref_nodes(bookmark_name: str, display_text: str) -> list[ET.Element]:
     return [_make_ref_field(bookmark_name, display_text)]
 
@@ -1133,6 +1148,74 @@ def _run_text(run: ET.Element) -> str:
     if run.tag != wqn("r"):
         return ""
     return "".join((node.text or "") for node in run.findall("./w:t", NS))
+
+
+def _collect_run_display_text(nodes: list[ET.Element]) -> str:
+    parts: list[str] = []
+    for node in nodes:
+        if node.tag != wqn("r"):
+            continue
+        text = _run_text(node)
+        if text:
+            parts.append(text)
+            continue
+        instr_text = _run_instr_text(node)
+        if instr_text:
+            parts.append(instr_text)
+    return "".join(parts)
+
+
+def _parse_direct_complex_field(
+    children: list[ET.Element],
+    start_idx: int,
+) -> dict[str, int | str | None] | None:
+    """
+    解析段落直接子节点上的复杂域，避免把外层域误配到内层域的 separate/end。
+    """
+    if start_idx < 0 or start_idx >= len(children):
+        return None
+    if _field_char_type(children[start_idx]) != "begin":
+        return None
+
+    instr_parts: list[str] = []
+    nested_depth = 0
+    separate_idx: int | None = None
+    probe_idx = start_idx + 1
+
+    while probe_idx < len(children):
+        child = children[probe_idx]
+        field_char_type = _field_char_type(child)
+
+        if field_char_type == "begin":
+            nested_depth += 1
+            probe_idx += 1
+            continue
+
+        if field_char_type == "end":
+            if nested_depth == 0:
+                return {
+                    "start_idx": start_idx,
+                    "separate_idx": separate_idx,
+                    "end_idx": probe_idx,
+                    "instr_text": "".join(instr_parts).strip(),
+                }
+            nested_depth -= 1
+            probe_idx += 1
+            continue
+
+        if field_char_type == "separate" and nested_depth == 0 and separate_idx is None:
+            separate_idx = probe_idx
+            probe_idx += 1
+            continue
+
+        if nested_depth == 0 and separate_idx is None:
+            instr_text = _run_instr_text(child)
+            if instr_text:
+                instr_parts.append(instr_text)
+
+        probe_idx += 1
+
+    return None
 
 
 def _run_text_matches_paren(run: ET.Element, paren: str) -> bool:
@@ -1219,6 +1302,46 @@ def _normalize_equation_display_seq_fields(paragraph: ET.Element) -> bool:
             continue
         child.set(wqn("instr"), target_instr)
         changed = True
+
+    children = list(paragraph)
+    idx = 0
+    while idx < len(children):
+        complex_field = _parse_direct_complex_field(children, idx)
+        if complex_field is None:
+            idx += 1
+            continue
+
+        end_idx = int(complex_field["end_idx"])
+        separate_idx = complex_field["separate_idx"]
+        instr_upper = str(complex_field["instr_text"]).upper()
+
+        if not any(token in instr_upper for token in seq_tokens_upper):
+            idx += 1
+            continue
+        if "\\H" in instr_upper and "\\C" not in instr_upper:
+            idx += 1
+            continue
+        if separate_idx is None:
+            idx += 1
+            continue
+
+        # 将复杂域 SEQ 直接改写为 fldSimple，避免编号目标继续保留不稳定结构。
+        display_text = _collect_run_display_text(children[int(separate_idx) + 1 : end_idx]).strip()
+        replacement = _make_seq_field(
+            EQUATION_SEQ_NAME,
+            field_switches=EQUATION_DISPLAY_SEQ_SWITCHES,
+        )
+        text_node = replacement.find("./w:r/w:t", NS)
+        if text_node is not None:
+            text_node.text = display_text
+
+        for node in children[idx : end_idx + 1]:
+            paragraph.remove(node)
+        paragraph.insert(idx, replacement)
+        changed = True
+
+        children = list(paragraph)
+        idx += 1
     return changed
 
 
@@ -2927,6 +3050,11 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
     )
     next_bookmark_id += bookmark_added_table
 
+    equation_seq_normalized = 0
+    for paragraph in display_equation_paragraphs:
+        if _normalize_equation_display_seq_fields(paragraph):
+            equation_seq_normalized += 1
+
     equation_prefix_tab_added = 0
     for paragraph in display_equation_paragraphs:
         if _ensure_equation_prefix_tab(paragraph):
@@ -3157,6 +3285,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
             table_style_applied_count,
             figure_seq_added,
             table_seq_added,
+            equation_seq_normalized,
             equation_seq_added,
             equation_prefix_tab_added,
             equation_number_tab_layout_fixed,
@@ -3217,6 +3346,7 @@ def run_docx_postprocess(docx_path: Path, tex_files: list[Path]) -> DocxPostproc
         "paragraph_labels_skipped_by_pairing_count": len(paragraph_labels_skipped_by_pairing),
         "figure_caption_seq_added": figure_seq_added,
         "table_caption_seq_added": table_seq_added,
+        "equation_seq_normalized": equation_seq_normalized,
         "equation_seq_added": equation_seq_added,
         "equation_prefix_tab_added": equation_prefix_tab_added,
         "equation_number_tab_layout_fixed": equation_number_tab_layout_fixed,

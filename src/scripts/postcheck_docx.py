@@ -379,6 +379,178 @@ def get_relationship_attr(rel: ET.Element, name: str) -> str:
     return rel.attrib.get(f"{{{PACKAGE_REL_NS}}}{name}", rel.attrib.get(name, ""))
 
 
+def get_word_attr(node: ET.Element, name: str) -> str:
+    return node.attrib.get(f"{{{NS['w']}}}{name}", "")
+
+
+def get_run_field_char_type(node: ET.Element) -> str:
+    if node.tag != f"{{{NS['w']}}}r":
+        return ""
+    fld_char = node.find("./w:fldChar", NS)
+    if fld_char is None:
+        return ""
+    return (get_word_attr(fld_char, "fldCharType") or "").strip().lower()
+
+
+def get_run_instr_text(node: ET.Element) -> str:
+    if node.tag != f"{{{NS['w']}}}r":
+        return ""
+    return "".join((item.text or "") for item in node.findall("./w:instrText", NS))
+
+
+def get_run_display_text(node: ET.Element) -> str:
+    if node.tag != f"{{{NS['w']}}}r":
+        return ""
+    text = "".join((item.text or "") for item in node.findall("./w:t", NS))
+    if text:
+        return text
+    return get_run_instr_text(node)
+
+
+def is_equation_display_seq_instr(instr_text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (instr_text or "").upper()).strip()
+    if not normalized or "\\C" not in normalized:
+        return False
+    return any(token in normalized for token in ("SEQ MTEQN", "SEQ EQ"))
+
+
+def parse_direct_complex_field(
+    children: list[ET.Element],
+    start_idx: int,
+) -> Optional[dict[str, object]]:
+    if start_idx < 0 or start_idx >= len(children):
+        return None
+    if get_run_field_char_type(children[start_idx]) != "begin":
+        return None
+
+    instr_parts: list[str] = []
+    nested_depth = 0
+    separate_idx: Optional[int] = None
+    probe_idx = start_idx + 1
+
+    while probe_idx < len(children):
+        child = children[probe_idx]
+        field_char_type = get_run_field_char_type(child)
+
+        if field_char_type == "begin":
+            nested_depth += 1
+            probe_idx += 1
+            continue
+
+        if field_char_type == "end":
+            if nested_depth == 0:
+                return {
+                    "start_idx": start_idx,
+                    "separate_idx": separate_idx,
+                    "end_idx": probe_idx,
+                    "instr_text": "".join(instr_parts).strip(),
+                }
+            nested_depth -= 1
+            probe_idx += 1
+            continue
+
+        if field_char_type == "separate" and nested_depth == 0 and separate_idx is None:
+            separate_idx = probe_idx
+            probe_idx += 1
+            continue
+
+        if nested_depth == 0 and separate_idx is None:
+            instr_text = get_run_instr_text(child)
+            if instr_text:
+                instr_parts.append(instr_text)
+
+        probe_idx += 1
+
+    return None
+
+
+def collect_equation_seq_field_stats(
+    paragraphs: list[ET.Element],
+) -> tuple[dict[str, int], list[dict[str, object]]]:
+    stats = {
+        "equation_display_seq_simple_field_count": 0,
+        "equation_display_seq_complex_field_count": 0,
+        "equation_number_bookmark_simple_field_count": 0,
+        "equation_number_bookmark_complex_field_count": 0,
+    }
+    examples: list[dict[str, object]] = []
+
+    for para_idx, paragraph in enumerate(paragraphs):
+        children = list(paragraph)
+        open_ranges: dict[str, dict[str, object]] = {}
+        closed_ranges: list[dict[str, object]] = []
+
+        for child_idx, child in enumerate(children):
+            if child.tag == f"{{{NS['w']}}}bookmarkStart":
+                name = (get_word_attr(child, "name") or "").strip()
+                bookmark_id = (get_word_attr(child, "id") or "").strip()
+                if name.startswith("ZEqnNum") and bookmark_id:
+                    open_ranges[bookmark_id] = {"name": name, "start_idx": child_idx}
+                continue
+
+            if child.tag != f"{{{NS['w']}}}bookmarkEnd":
+                continue
+
+            bookmark_id = (get_word_attr(child, "id") or "").strip()
+            if bookmark_id not in open_ranges:
+                continue
+            bookmark_range = open_ranges.pop(bookmark_id)
+            bookmark_range["end_idx"] = child_idx
+            closed_ranges.append(bookmark_range)
+
+        def inside_number_bookmark(start_idx: int, end_idx: int) -> tuple[bool, list[str]]:
+            names = [
+                str(item["name"])
+                for item in closed_ranges
+                if int(item["start_idx"]) <= start_idx and end_idx <= int(item["end_idx"])
+            ]
+            return bool(names), names
+
+        for child_idx, child in enumerate(children):
+            if child.tag == f"{{{NS['w']}}}fldSimple":
+                instr_text = get_word_attr(child, "instr")
+                if not is_equation_display_seq_instr(instr_text):
+                    continue
+                stats["equation_display_seq_simple_field_count"] += 1
+                in_number_bookmark, _ = inside_number_bookmark(child_idx, child_idx)
+                if in_number_bookmark:
+                    stats["equation_number_bookmark_simple_field_count"] += 1
+                continue
+
+            complex_field = parse_direct_complex_field(children, child_idx)
+            if complex_field is None:
+                continue
+            instr_text = str(complex_field["instr_text"])
+            if not is_equation_display_seq_instr(instr_text):
+                continue
+
+            start_idx = int(complex_field["start_idx"])
+            end_idx = int(complex_field["end_idx"])
+            stats["equation_display_seq_complex_field_count"] += 1
+            in_number_bookmark, bookmark_names = inside_number_bookmark(start_idx, end_idx)
+            if in_number_bookmark:
+                stats["equation_number_bookmark_complex_field_count"] += 1
+            if len(examples) < 20:
+                separate_idx = complex_field["separate_idx"]
+                if isinstance(separate_idx, int):
+                    result_nodes = children[separate_idx + 1 : end_idx]
+                else:
+                    result_nodes = []
+                display_text = "".join(get_run_display_text(node) for node in result_nodes).strip()
+                examples.append(
+                    {
+                        "paragraph_index": para_idx,
+                        "field_kind": "complex",
+                        "instr_text": instr_text.strip(),
+                        "inside_number_bookmark": in_number_bookmark,
+                        "number_bookmarks": bookmark_names,
+                        "display_text": display_text,
+                    }
+                )
+
+    return stats, examples
+
+
 def normalize_relationship_target(target: str, owner_part: str = "word/document.xml") -> str:
     """
     将 relationship Target 规范化为 docx 包内路径。
@@ -805,6 +977,10 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
         "field_pageref_count": 0,
         "field_seq_count": 0,
         "field_toc_count": 0,
+        "equation_display_seq_simple_field_count": 0,
+        "equation_display_seq_complex_field_count": 0,
+        "equation_number_bookmark_simple_field_count": 0,
+        "equation_number_bookmark_complex_field_count": 0,
         "bibliography_section_found": False,
         "bibliography_heading_text": None,
         "bibliography_following_paragraph_count": 0,
@@ -948,6 +1124,36 @@ def inspect_docx(docx_path: Path) -> tuple[dict, list[Finding]]:
             body_children = list(body)
             paragraphs = [child for child in body_children if child.tag == f"{{{NS['w']}}}p"]
             inventory["paragraph_count"] = len(paragraphs)
+
+            equation_seq_stats, equation_seq_examples = collect_equation_seq_field_stats(paragraphs)
+            inventory.update(equation_seq_stats)
+            if inventory["equation_number_bookmark_complex_field_count"] > 0:
+                findings.append(
+                    Finding(
+                        severity=SEVERITY_ERROR,
+                        code="EQUATION_NUMBER_COMPLEX_SEQ_FIELD_DETECTED",
+                        message="检测到落在 ZEqnNum 公式编号书签内的复杂域 SEQ 字段；这类编号目标结构不稳定，可能导致公式引用失效。",
+                        location="word/document.xml",
+                        details={
+                            "equation_number_bookmark_complex_field_count": inventory["equation_number_bookmark_complex_field_count"],
+                            "equation_display_seq_complex_field_count": inventory["equation_display_seq_complex_field_count"],
+                            "equation_seq_field_examples": equation_seq_examples,
+                        },
+                    )
+                )
+            elif inventory["equation_display_seq_complex_field_count"] > 0:
+                findings.append(
+                    Finding(
+                        severity=SEVERITY_WARN,
+                        code="EQUATION_COMPLEX_SEQ_FIELD_DETECTED",
+                        message="检测到复杂域形式的公式编号 SEQ 字段；建议统一改写为 fldSimple，避免后续格式化导致编号目标漂移。",
+                        location="word/document.xml",
+                        details={
+                            "equation_display_seq_complex_field_count": inventory["equation_display_seq_complex_field_count"],
+                            "equation_seq_field_examples": equation_seq_examples,
+                        },
+                    )
+                )
 
             paragraph_texts: list[str] = []
             heading_flags: list[bool] = []
