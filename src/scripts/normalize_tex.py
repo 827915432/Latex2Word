@@ -80,6 +80,7 @@ python scripts/normalize_tex.py --project-root D:/work/my-paper --force
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import sys
@@ -189,6 +190,8 @@ DEFAULT_COPY_IGNORE_NAMES = {
     ".mypy_cache",
     ".DS_Store",
 }
+
+WORD_SAFE_LABEL_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # -----------------------------------------------------------------------------
 # 数据结构定义
@@ -1076,6 +1079,138 @@ def normalize_extended_refs(text: str, file_path: Path, root: Path) -> tuple[str
     text = autoref_pattern.sub(autoref_repl, text)
     text = cref_pattern.sub(cref_repl, text)
     text = subref_pattern.sub(subref_repl, text)
+    return text, actions
+
+
+def make_word_safe_label_name(label: str) -> str:
+    """
+    将 LaTeX 标签名改写为 Word 书签可稳定承载的安全名称。
+
+    处理原则：
+    - 仅保留字母、数字和下划线；
+    - 首字符必须为字母或下划线；
+    - 对发生改写的标签追加短哈希，避免不同原标签收敛到同名。
+    """
+    label_key = label.strip()
+    if not label_key:
+        return label_key
+    if WORD_SAFE_LABEL_PATTERN.fullmatch(label_key):
+        return label_key
+
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", label_key)
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base:
+        base = "L2W"
+    if not re.match(r"[A-Za-z_]", base[0]):
+        base = f"L2W_{base}"
+    if len(base) > 24:
+        base = base[:24].rstrip("_")
+        if not base:
+            base = "L2W"
+
+    digest = hashlib.sha1(label_key.encode("utf-8")).hexdigest()[:10]
+    return f"{base}_{digest}"
+
+
+def collect_word_safe_label_mapping(tex_files: list[Path]) -> dict[str, str]:
+    """
+    扫描整个工程的 ``\\label``，建立“原标签 -> Word 安全标签”的全局映射。
+
+    之所以按工程级收集，而不是单文件即时改写，是因为 ``\\ref`` 可能跨文件引用。
+    """
+    mapping: dict[str, str] = {}
+    for tex_file in tex_files:
+        text = read_text_file(tex_file)
+        for _start, _end, payload in _find_command_occurrences_with_payload(text, "label"):
+            label = payload.strip()
+            if not label:
+                continue
+            safe_label = make_word_safe_label_name(label)
+            if safe_label != label:
+                mapping[label] = safe_label
+    return mapping
+
+
+def _replace_text_spans(text: str, replacements: list[tuple[int, int, str]]) -> str:
+    """
+    按原始坐标批量替换若干文本区间。
+    """
+    if not replacements:
+        return text
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end, replacement in sorted(replacements, key=lambda item: (item[0], item[1])):
+        if start < cursor or end <= start:
+            continue
+        parts.append(text[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _rewrite_command_labels(
+    text: str,
+    file_path: Path,
+    root: Path,
+    command_name: str,
+    label_mapping: dict[str, str],
+) -> tuple[str, list[ActionRecord]]:
+    """
+    重写指定命令中的标签 payload。
+    """
+    actions: list[ActionRecord] = []
+    replacements: list[tuple[int, int, str]] = []
+    occurrences = _find_command_occurrences_with_payload(text, command_name)
+
+    for start, end, payload in occurrences:
+        label = payload.strip()
+        # 严格规范化不能只依赖“该标签是否已在 \\label 中定义”。
+        # 即使某个 \\ref / \\eqref 暂时没有匹配到已定义标签，也必须先把危险字符
+        # 从名字中剔除，避免原始 payload 继续传递到 Word 书签/锚点层。
+        safe_label = label_mapping.get(label) or make_word_safe_label_name(label)
+        if safe_label == label:
+            continue
+
+        replacements.append((start, end, f"\\{command_name}{{{safe_label}}}"))
+        line_no = line_number_from_offset(text, start)
+        actions.append(
+            ActionRecord(
+                action_type="normalize_word_unsafe_label",
+                severity=SEVERITY_WARN,
+                file=safe_relative(file_path, root),
+                line=line_no,
+                message="将包含 Word 不安全字符的标签名统一改写为安全名称。",
+                details={
+                    "command": command_name,
+                    "old_label": label,
+                    "new_label": safe_label,
+                },
+            )
+        )
+
+    return _replace_text_spans(text, replacements), actions
+
+
+def normalize_word_safe_labels(
+    text: str,
+    file_path: Path,
+    root: Path,
+    label_mapping: dict[str, str],
+) -> tuple[str, list[ActionRecord]]:
+    """
+    将 ``\\label`` 及其常用引用命令统一改写为 Word 安全标签名。
+
+    根因：
+    - 带 ``.``、``:``、空格、连字符等危险字符的 LaTeX 标签会继续传递到 Pandoc/Word 书签层；
+    - 这些名字会污染 Word/MathType 的编号与隐藏书签上下文，后续格式化和更新域不稳定；
+    - 即使某个引用当前没有匹配到对应 ``\\label``，也不能放任危险字符原样进入 Word 层。
+    """
+    actions: list[ActionRecord] = []
+    for command_name in ("label", "ref", "eqref", "pageref"):
+        text, file_actions = _rewrite_command_labels(text, file_path, root, command_name, label_mapping)
+        actions.extend(file_actions)
     return text, actions
 
 
@@ -2411,6 +2546,7 @@ def process_tex_file(
     file_path: Path,
     work_root: Path,
     macros: dict[str, MacroDefinition],
+    label_mapping: dict[str, str],
 ) -> tuple[bool, list[ActionRecord]]:
     """
     对单个 TeX 文件执行规范化动作。
@@ -2434,6 +2570,7 @@ def process_tex_file(
     12. 将 table* 环境降级为 table
     13. 将 algorithm 环境降级为 Pandoc 稳定块结构
     14. 展开安全零参数宏
+    15. 将标签名统一改写为 Word 安全名称
 
     顺序理由：
     - 先做低风险路径规范化；
@@ -2485,6 +2622,9 @@ def process_tex_file(
     actions.extend(file_actions)
 
     text, file_actions = expand_zero_arg_macros(text, file_path, work_root, macros)
+    actions.extend(file_actions)
+
+    text, file_actions = normalize_word_safe_labels(text, file_path, work_root, label_mapping)
     actions.extend(file_actions)
 
     modified = text != original_text
@@ -3016,13 +3156,21 @@ def main() -> int:
     macros, macro_actions = collect_zero_arg_macros(target_tex_files, normalized_source_root)
     action_log.extend(macro_actions)
 
+    # 先建立全工程标签映射，再逐文件统一重写，避免跨文件引用断裂。
+    label_mapping = collect_word_safe_label_mapping(target_tex_files)
+
     # 逐文件规范化
     file_summaries: list[FileSummary] = []
     modified_count = 0
 
     for tex_file in target_tex_files:
         try:
-            modified, file_actions = process_tex_file(tex_file, normalized_source_root, macros)
+            modified, file_actions = process_tex_file(
+                tex_file,
+                normalized_source_root,
+                macros,
+                label_mapping,
+            )
             action_log.extend(file_actions)
 
             actions_by_type = Counter(action.action_type for action in file_actions)
