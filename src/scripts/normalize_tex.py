@@ -147,26 +147,6 @@ MATH_BLOCK_ENV_NAMES = (
     "eqnarray",
     "eqnarray*",
 )
-THEOREM_LIKE_ENV_NAMES = (
-    "definition",
-    "definition*",
-    "theorem",
-    "theorem*",
-    "lemma",
-    "lemma*",
-    "proposition",
-    "proposition*",
-    "corollary",
-    "corollary*",
-    "remark",
-    "remark*",
-    "example",
-    "example*",
-    "assumption",
-    "assumption*",
-    "property",
-    "property*",
-)
 THEOREM_LIKE_ENV_DISPLAY_TITLES = {
     "definition": "Definition",
     "theorem": "Theorem",
@@ -178,6 +158,59 @@ THEOREM_LIKE_ENV_DISPLAY_TITLES = {
     "assumption": "Assumption",
     "property": "Property",
 }
+
+# theorem-like 环境别名映射（含大小写/缩写友好）
+# value 为规范基名（不含 *），用于标题显示与统计归一。
+THEOREM_LIKE_ENV_BASE_ALIASES = {
+    "definition": "definition",
+    "def": "definition",
+    "theorem": "theorem",
+    "thm": "theorem",
+    "lemma": "lemma",
+    "lem": "lemma",
+    "proposition": "proposition",
+    "prop": "proposition",
+    "pro": "proposition",
+    "corollary": "corollary",
+    "cor": "corollary",
+    "remark": "remark",
+    "rem": "remark",
+    "example": "example",
+    "ex": "example",
+    "assumption": "assumption",
+    "asm": "assumption",
+    "property": "property",
+}
+
+
+def _build_theorem_like_env_alias_to_canonical() -> dict[str, str]:
+    alias_to_canonical: dict[str, str] = {}
+
+    def _register(alias_name: str, canonical_name: str) -> None:
+        alias_key = alias_name.strip()
+        canonical_key = canonical_name.strip()
+        if not alias_key or not canonical_key:
+            return
+        if alias_key not in alias_to_canonical:
+            alias_to_canonical[alias_key] = canonical_key
+
+    for raw_alias, canonical_base in THEOREM_LIKE_ENV_BASE_ALIASES.items():
+        alias = raw_alias.strip()
+        canonical = canonical_base.strip()
+        if not alias or not canonical:
+            continue
+
+        # 支持常见大小写写法：lemma/Lemma、thm/Thm、pro/Pro 等。
+        variants = {alias, alias.lower(), alias.capitalize()}
+        for variant in variants:
+            _register(variant, canonical)
+            _register(f"{variant}*", canonical)
+
+    return alias_to_canonical
+
+
+THEOREM_LIKE_ENV_ALIAS_TO_CANONICAL = _build_theorem_like_env_alias_to_canonical()
+THEOREM_LIKE_ENV_NAMES = tuple(sorted(THEOREM_LIKE_ENV_ALIAS_TO_CANONICAL.keys(), key=len, reverse=True))
 
 # 默认忽略复制的目录/文件名。
 # 这些内容对 LaTeX -> Word 主流程没有帮助，反而会污染工作副本。
@@ -2190,8 +2223,12 @@ def _theorem_like_heading(env_name: str, optional_title: Optional[str]) -> str:
     """
     生成 theorem-like 降级后的人类可读标题。
     """
-    base_name = env_name[:-1] if env_name.endswith("*") else env_name
-    base_title = THEOREM_LIKE_ENV_DISPLAY_TITLES.get(base_name, base_name.title())
+    raw_name = env_name.strip()
+    canonical_base = THEOREM_LIKE_ENV_ALIAS_TO_CANONICAL.get(raw_name, "")
+    if not canonical_base:
+        non_star = raw_name[:-1] if raw_name.endswith("*") else raw_name
+        canonical_base = THEOREM_LIKE_ENV_ALIAS_TO_CANONICAL.get(non_star, non_star)
+    base_title = THEOREM_LIKE_ENV_DISPLAY_TITLES.get(canonical_base, canonical_base.title())
     if optional_title:
         return f"{base_title} ({optional_title})"
     return base_title
